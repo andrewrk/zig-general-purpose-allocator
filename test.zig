@@ -1,4 +1,6 @@
 const std = @import("std");
+const os = std.os;
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const page_size = std.os.page_size;
@@ -35,7 +37,13 @@ const GeneralPurposeDebugAllocator = struct {
         end_index: usize,
     };
 
-    pub fn init(self: *GeneralPurposeDebugAllocator) void {
+    pub fn create() !*GeneralPurposeDebugAllocator {
+        comptime assert(page_size >= @sizeOf(GeneralPurposeDebugAllocator));
+        const perms = posix.PROT_READ | posix.PROT_WRITE;
+        const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
+        const addr = posix.mmap(null, page_size, perms, flags, -1, 0);
+        if (addr == posix.MAP_FAILED) return error.OutOfMemory;
+        const self = @intToPtr(*GeneralPurposeDebugAllocator, addr);
         self.* = GeneralPurposeDebugAllocator{
             .allocator = Allocator{
                 .allocFn = alloc,
@@ -57,9 +65,23 @@ const GeneralPurposeDebugAllocator = struct {
             };
             offset = next_offset;
         }
+        try self.mprotectInit(posix.PROT_READ);
+        return self;
     }
 
-    pub fn detectLeaks(self: *GeneralPurposeDebugAllocator) void {
+    fn mprotectInit(self: *GeneralPurposeDebugAllocator, protection: u32) !void {
+        os.posixMProtect(@ptrToInt(self), page_size, protection) catch |e| switch (e) {
+            error.AccessDenied => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unexpected => return error.OutOfMemory,
+        };
+    }
+
+    fn mprotect(self: *GeneralPurposeDebugAllocator, protection: u32) void {
+        os.posixMProtect(@ptrToInt(self), page_size, protection) catch unreachable;
+    }
+
+    pub fn destroy(self: *GeneralPurposeDebugAllocator) void {
         for (self.buckets) |*bucket| {
             for (bucket.used_bits) |used_byte| {
                 if (used_byte != 0) {
@@ -76,10 +98,15 @@ const GeneralPurposeDebugAllocator = struct {
                 }
             }
         }
+        const err = posix.munmap(@ptrToInt(self), page_size);
+        assert(posix.getErrno(err) == 0);
     }
 
     fn alloc(allocator: *Allocator, n: usize, alignment: u29) error{OutOfMemory}![]u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
+        self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+        defer self.mprotect(posix.PROT_READ);
+
         if (n > (1 << (small_bucket_count - 1))) {
             return error.OutOfMemory;
         }
@@ -130,6 +157,8 @@ const GeneralPurposeDebugAllocator = struct {
 
     fn free(allocator: *Allocator, bytes: []u8) void {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
+        self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+        defer self.mprotect(posix.PROT_READ);
         const rounded_n = up_to_nearest_power_of_2(usize, bytes.len);
         const bucket_index = std.math.log2(rounded_n);
         const bucket = &self.buckets[bucket_index];
@@ -145,10 +174,9 @@ const GeneralPurposeDebugAllocator = struct {
     }
 };
 
-test "oaeu" {
-    var gpda: GeneralPurposeDebugAllocator = undefined;
-    gpda.init();
-    defer gpda.detectLeaks();
+test "basic" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
     const allocator = &gpda.allocator;
 
     var i: usize = 0;
@@ -160,3 +188,11 @@ test "oaeu" {
         allocator.destroy(alloc1);
     }
 }
+//    var frames: [4]usize = undefined;
+//    var stack_trace = builtin.StackTrace{
+//        .instruction_addresses = frames[0..],
+//        .index = 0,
+//    };
+//    std.debug.captureStackTrace(null, &stack_trace);
+//
+//    std.debug.dumpStackTrace(stack_trace);

@@ -25,6 +25,8 @@ into the [Zig](https://ziglang.org/) standard library, with the focus on these g
 
  * OK for performance cost for these mechanisms.
 
+ * Rogue memory writes should not harm the allocator's state.
+
 ## Goals for Other General Purpose Allocators But Not This One
 
 ReleaseFast and ReleaseSmall Modes:
@@ -102,6 +104,8 @@ corresponding bit is 1 and set it to 0.
 ## Roadmap
 
 * Make the leak detector print stack traces of the allocations
+
+* Decide if it's going to be thread-safe or not.
 * Make it reuse freed memory
 * Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
