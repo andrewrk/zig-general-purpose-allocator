@@ -144,8 +144,7 @@ const GeneralPurposeDebugAllocator = struct {
         if (n > (1 << (small_bucket_count - 1))) {
             return error.OutOfMemory;
         }
-        // round n up to nearest power of 2
-        const size_class = up_to_nearest_power_of_2(usize, n);
+        const size_class = std.math.max(up_to_nearest_power_of_2(usize, n), alignment);
         const bucket_index = std.math.log2(size_class);
         const bucket = self.buckets[bucket_index] orelse blk: {
             const perms = posix.PROT_READ | posix.PROT_WRITE;

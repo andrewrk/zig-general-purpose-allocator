@@ -96,9 +96,17 @@ writable, and then removes write permissions before returning.
 * Decide if it's going to be thread-safe or not.
 * Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
-* Prevent more kinds of errors
+* Handle the case when realloc sized down and free would find another bucket.
+* On double free, print the allocation stack trace, first free trace, and second free trace.
+* Make allocations favor iterating forward over slots. Favor using new slots in
+  the same memory page over reusing freed slots.
 * Give memory back to the OS as often as possible. If a page can be unmapped then it
   should be unmapped.
+* Catch the error when wrong n or wrong alignment is given to free or realloc/shrink.
+* Ability to print stats
+  * Requested Bytes Allocated (total of n for every alloc minus n for every free)
+  * Resident Bytes (pagesize * number of pages mmapped for slots)
+  * Overhead Bytes (how much memory the allocator state is using)
 * Validation fuzz testing
 * Performance benchmarking
 * Iterate over usize instead of u8 for used bits
