@@ -13,7 +13,8 @@ fn up_to_nearest_power_of_2(comptime T: type, n: T) T {
     return power;
 }
 
-const wanted_stack_frame_count = 4;
+// Number of stack frames to capture
+const stack_n = 4;
 
 // Bucket: In memory, in order:
 // * BucketHeader
@@ -25,19 +26,33 @@ const BucketHeader = struct {
     next: ?*BucketHeader,
     page: [*]align(page_size) u8,
     used_bits_index: usize,
-    all_used: bool,
+    used_count: usize,
 
     fn usedBits(bucket: *BucketHeader, index: usize) *u8 {
         return @intToPtr(*u8, @ptrToInt(bucket) + @sizeOf(BucketHeader) + index);
     }
+
+    fn stackTracePtr(
+        bucket: *BucketHeader,
+        size_class: usize,
+        slot_index: usize,
+    ) *[stack_n]usize {
+        const start_ptr = @ptrCast([*]u8, bucket) + bucketStackFramesStart(size_class);
+        const one_trace_size = @sizeOf(usize) * stack_n;
+        const addr = start_ptr + one_trace_size * slot_index;
+        return @ptrCast(*[stack_n]usize, addr);
+    }
 };
 
-fn bucketSize(size_class: usize) usize {
-    const stack_frames_start = std.mem.alignForward(
+fn bucketStackFramesStart(size_class: usize) usize {
+    return std.mem.alignForward(
         @sizeOf(BucketHeader) + usedBitsCount(size_class),
         @alignOf(usize),
     );
-    return stack_frames_start + wanted_stack_frame_count * @sizeOf(usize);
+}
+
+fn bucketSize(size_class: usize) usize {
+    return bucketStackFramesStart(size_class) + stack_n * @sizeOf(usize);
 }
 
 fn usedBitsCount(size_class: usize) usize {
@@ -49,7 +64,7 @@ const GeneralPurposeDebugAllocator = struct {
     allocator: Allocator,
     buckets: [small_bucket_count]?*BucketHeader,
 
-    const small_bucket_count = 8;
+    const small_bucket_count = std.math.log2(page_size);
 
     pub fn create() !*GeneralPurposeDebugAllocator {
         comptime assert(page_size >= @sizeOf(GeneralPurposeDebugAllocator));
@@ -85,8 +100,8 @@ const GeneralPurposeDebugAllocator = struct {
     pub fn destroy(self: *GeneralPurposeDebugAllocator) void {
         for (self.buckets) |optional_bucket, bucket_i| {
             const bucket = optional_bucket orelse continue;
-            const rounded_n = usize(1) << @intCast(u6, bucket_i);
-            const used_bits_count = usedBitsCount(rounded_n);
+            const size_class = usize(1) << @intCast(u6, bucket_i);
+            const used_bits_count = usedBitsCount(size_class);
             var used_bits_byte: usize = 0;
             while (used_bits_byte < used_bits_count) : (used_bits_byte += 1) {
                 const used_byte = bucket.usedBits(used_bits_byte).*;
@@ -96,7 +111,20 @@ const GeneralPurposeDebugAllocator = struct {
                         const is_used = @truncate(u1, used_byte >> bit_index) != 0;
                         if (is_used) {
                             std.debug.warn("\nMemory leak detected:\n");
-                            // TODO stack trace
+                            const slot_index = used_bits_byte * 8 + bit_index;
+                            const stack_addresses = bucket.stackTracePtr(
+                                size_class,
+                                slot_index,
+                            );
+                            var len: usize = 0;
+                            while (len < stack_n and stack_addresses[len] != 0) {
+                                len += 1;
+                            }
+                            const stack_trace = builtin.StackTrace{
+                                .instruction_addresses = stack_addresses,
+                                .index = len,
+                            };
+                            std.debug.dumpStackTrace(stack_trace);
                         }
                         if (bit_index == std.math.maxInt(u3))
                             break;
@@ -117,8 +145,8 @@ const GeneralPurposeDebugAllocator = struct {
             return error.OutOfMemory;
         }
         // round n up to nearest power of 2
-        const rounded_n = up_to_nearest_power_of_2(usize, n);
-        const bucket_index = std.math.log2(rounded_n);
+        const size_class = up_to_nearest_power_of_2(usize, n);
+        const bucket_index = std.math.log2(size_class);
         const bucket = self.buckets[bucket_index] orelse blk: {
             const perms = posix.PROT_READ | posix.PROT_WRITE;
             const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
@@ -126,7 +154,7 @@ const GeneralPurposeDebugAllocator = struct {
             if (addr == posix.MAP_FAILED) return error.OutOfMemory;
             errdefer assert(posix.getErrno(posix.munmap(addr, page_size)) == 0);
 
-            const bucket_size = bucketSize(rounded_n);
+            const bucket_size = bucketSize(size_class);
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
             const bucket_addr = posix.mmap(null, page_size, perms, flags, -1, 0);
             if (bucket_addr == posix.MAP_FAILED) return error.OutOfMemory;
@@ -137,25 +165,20 @@ const GeneralPurposeDebugAllocator = struct {
                 .next = null,
                 .page = @intToPtr([*]align(page_size) u8, addr),
                 .used_bits_index = 0,
-                .all_used = false,
+                .used_count = 0,
             };
             self.buckets[bucket_index] = ptr;
             break :blk ptr;
         };
-        if (bucket.all_used) {
+        if (bucket.used_count == usize(page_size) >> @intCast(u6, bucket_index)) {
             // TODO: find available bucket, or allocate a new one
             return error.OutOfMemory;
         }
-        const start_index = bucket.used_bits_index;
+        bucket.used_count += 1;
         var used_bits_byte = bucket.usedBits(bucket.used_bits_index);
         while (used_bits_byte.* == 0xff) {
             bucket.used_bits_index = (bucket.used_bits_index + 1) %
-                usedBitsCount(rounded_n);
-            if (bucket.used_bits_index == start_index) {
-                bucket.all_used = true;
-                // TODO: find available bucket, or allocate a new one
-                return error.OutOfMemory;
-            }
+                usedBitsCount(size_class);
             used_bits_byte = bucket.usedBits(bucket.used_bits_index);
         }
         var used_bit_index: u3 = 0;
@@ -166,7 +189,18 @@ const GeneralPurposeDebugAllocator = struct {
         used_bits_byte.* |= (u8(1) << used_bit_index);
 
         const slot_index = bucket.used_bits_index * 8 + used_bit_index;
-        const result = (bucket.page + slot_index * rounded_n)[0..n];
+
+        // Initialize them to 0. When determining the count we must look
+        // for non zero addresses.
+        const stack_addresses = bucket.stackTracePtr(size_class, slot_index);
+        std.mem.set(usize, stack_addresses, 0);
+        var stack_trace = builtin.StackTrace{
+            .instruction_addresses = stack_addresses,
+            .index = 0,
+        };
+        std.debug.captureStackTrace(@ptrToInt(@returnAddress()), &stack_trace);
+
+        const result = (bucket.page + slot_index * size_class)[0..n];
         assert(result.len != 0);
         return result;
     }
@@ -190,18 +224,19 @@ const GeneralPurposeDebugAllocator = struct {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
-        const rounded_n = up_to_nearest_power_of_2(usize, bytes.len);
-        const bucket_index = std.math.log2(rounded_n);
+        const size_class = up_to_nearest_power_of_2(usize, bytes.len);
+        const bucket_index = std.math.log2(size_class);
         const bucket = self.buckets[bucket_index].?;
         // right now alloc will not create more buckets so we assume that
         const byte_offset = @ptrToInt(bytes.ptr) - @ptrToInt(bucket.page);
-        const slot_index = byte_offset / rounded_n;
+        const slot_index = byte_offset / size_class;
         const used_byte_index = slot_index / 8;
         const used_bit_index = @intCast(u3, slot_index % 8);
         const used_byte = bucket.usedBits(used_byte_index);
         const is_used = @truncate(u1, used_byte.* >> used_bit_index) != 0;
         assert(is_used);
         used_byte.* &= ~(u8(1) << used_bit_index);
+        bucket.used_count -= 1;
         // TODO: if we freed the last slot, unmap the page
     }
 };
@@ -211,6 +246,7 @@ test "basic" {
     defer gpda.destroy();
     const allocator = &gpda.allocator;
 
+    std.debug.warn("\n");
     var i: usize = 0;
     while (i < 4) : (i += 1) {
         const alloc1 = try allocator.create(i32);
@@ -220,11 +256,3 @@ test "basic" {
         allocator.destroy(alloc1);
     }
 }
-//    var frames: [4]usize = undefined;
-//    var stack_trace = builtin.StackTrace{
-//        .instruction_addresses = frames[0..],
-//        .index = 0,
-//    };
-//    std.debug.captureStackTrace(null, &stack_trace);
-//
-//    std.debug.dumpStackTrace(stack_trace);

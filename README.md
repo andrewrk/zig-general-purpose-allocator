@@ -1,6 +1,7 @@
 # GeneralPurposeDebugAllocator
 
 This is the code for [my Zig Live Coding Stream](https://www.twitch.tv/andrewrok).
+
 [Support my work on Patreon](https://www.patreon.com/andrewrk).
 
 This is a work-in-progress general purpose allocator intended to be eventually merged
@@ -51,27 +52,7 @@ POSIX-only so far.
 
 Able to detect memory leaks:
 
-```
-zig test test.zig
-Test 1/1 oaeu...alloc1 = i32@7f27fbfda000
-alloc2 = i32@7f27fbfda004
-alloc1 = i32@7f27fbfda008
-alloc2 = i32@7f27fbfda00c
-alloc1 = i32@7f27fbfda010
-alloc2 = i32@7f27fbfda014
-alloc1 = i32@7f27fbfda018
-alloc2 = i32@7f27fbfda01c
-
-Memory leak detected:
-
-Memory leak detected:
-
-Memory leak detected:
-
-Memory leak detected:
-OK
-All tests passed.
-```
+![](https://i.imgur.com/KufxrKm.png)
 
 Only able to allocate 1 memory page per bucket, and does not support
 large allocations.
@@ -90,29 +71,35 @@ index obj_size
 5     32
 6     64
 7     128
+8     256
+9     512
+10    1024
+11    2048
 ```
 
 Each bucket starts with no pages allocated. When the first object is allocated
-for a given bucket, it allocates 1 page of memory from the OS. Each successive
-allocation grabs the next slot from the bucket. Once all slots are exhausted
-the allocator always returns OutOfMemory.
+for a given bucket, it allocates 1 page of memory from the OS. This page is
+divided into "slots" - one per allocated object. Along with the page of memory
+for object slots, as many pages as necessary are allocated to store the
+BucketHeader, followed by "used bits", and a stack trace for each slot.
 
-Each bucket has 1 bit per slot representing whether the slot is used. Allocations
-assert that the corresponding bit is 0 and set it to 1. Frees assert that the
+The "used bits" are 1 bit per slot representing whether the slot is used.
+Allocations use the data to iterate to find a free slot. Frees assert that the
 corresponding bit is 1 and set it to 0.
+
+The memory for the allocator goes on its own page, with no write permissions.
+On call to alloc and free, the allocator uses mprotect to make its own state
+writable, and then removes write permissions before returning.
 
 ## Roadmap
 
-* Make the leak detector print stack traces of the allocations
-
 * Decide if it's going to be thread-safe or not.
-* Make it reuse freed memory
 * Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
 * Prevent more kinds of errors
 * Give memory back to the OS as often as possible. If a page can be unmapped then it
   should be unmapped.
-* Clear read/write permission bits on the allocator state itself, outside of function
-  calls, so that non-allocator code cannot modify its state.
 * Validation fuzz testing
 * Performance benchmarking
+* Iterate over usize instead of u8 for used bits
+* Port to Windows
