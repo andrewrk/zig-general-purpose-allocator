@@ -44,6 +44,25 @@ const BucketHeader = struct {
     }
 };
 
+fn bucketStackTrace(
+    bucket: *BucketHeader,
+    size_class: usize,
+    slot_index: usize,
+) builtin.StackTrace {
+    const stack_addresses = bucket.stackTracePtr(
+        size_class,
+        slot_index,
+    );
+    var len: usize = 0;
+    while (len < stack_n and stack_addresses[len] != 0) {
+        len += 1;
+    }
+    return builtin.StackTrace{
+        .instruction_addresses = stack_addresses,
+        .index = len,
+    };
+}
+
 fn bucketStackFramesStart(size_class: usize) usize {
     return std.mem.alignForward(
         @sizeOf(BucketHeader) + usedBitsCount(size_class),
@@ -112,18 +131,11 @@ const GeneralPurposeDebugAllocator = struct {
                         if (is_used) {
                             std.debug.warn("\nMemory leak detected:\n");
                             const slot_index = used_bits_byte * 8 + bit_index;
-                            const stack_addresses = bucket.stackTracePtr(
+                            const stack_trace = bucketStackTrace(
+                                bucket,
                                 size_class,
                                 slot_index,
                             );
-                            var len: usize = 0;
-                            while (len < stack_n and stack_addresses[len] != 0) {
-                                len += 1;
-                            }
-                            const stack_trace = builtin.StackTrace{
-                                .instruction_addresses = stack_addresses,
-                                .index = len,
-                            };
                             std.debug.dumpStackTrace(stack_trace);
                         }
                         if (bit_index == std.math.maxInt(u3))
@@ -233,14 +245,20 @@ const GeneralPurposeDebugAllocator = struct {
         const used_bit_index = @intCast(u3, slot_index % 8);
         const used_byte = bucket.usedBits(used_byte_index);
         const is_used = @truncate(u1, used_byte.* >> used_bit_index) != 0;
-        assert(is_used);
+        if (!is_used) {
+            // print allocation stack trace
+            const stack_trace = bucketStackTrace(bucket, size_class, slot_index);
+            std.debug.warn("\nDouble free detected, allocated here:\n");
+            std.debug.dumpStackTrace(stack_trace);
+            @panic("\nSecond free here:");
+        }
         used_byte.* &= ~(u8(1) << used_bit_index);
         bucket.used_count -= 1;
         // TODO: if we freed the last slot, unmap the page
     }
 };
 
-test "basic" {
+test "leaks" {
     const gpda = try GeneralPurposeDebugAllocator.create();
     defer gpda.destroy();
     const allocator = &gpda.allocator;
@@ -250,8 +268,27 @@ test "basic" {
     while (i < 4) : (i += 1) {
         const alloc1 = try allocator.create(i32);
         std.debug.warn("alloc1 = {}\n", alloc1);
+        defer allocator.destroy(alloc1);
+
         const alloc2 = try allocator.create(i32);
         std.debug.warn("alloc2 = {}\n", alloc2);
-        allocator.destroy(alloc1);
+        //defer allocator.destroy(alloc2);
     }
+}
+
+test "double free" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    std.debug.warn("\n");
+
+    const alloc1 = try allocator.create(i32);
+    std.debug.warn("alloc1 = {}\n", alloc1);
+
+    const alloc2 = try allocator.create(i32);
+    std.debug.warn("alloc2 = {}\n", alloc2);
+
+    allocator.destroy(alloc1);
+    allocator.destroy(alloc1);
 }

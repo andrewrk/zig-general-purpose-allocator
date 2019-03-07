@@ -91,9 +91,12 @@ The memory for the allocator goes on its own page, with no write permissions.
 On call to alloc and free, the allocator uses mprotect to make its own state
 writable, and then removes write permissions before returning.
 
+There are comptime configuration parameters. One of them is whether or not
+the allocator should be thread-safe. If thread-safety is disabled, then the
+debug allocator will detect invalid thread usage with it.
+
 ## Roadmap
 
-* Decide if it's going to be thread-safe or not.
 * Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
 * Handle the case when realloc sized down and free would find another bucket.
@@ -111,3 +114,7 @@ writable, and then removes write permissions before returning.
 * Performance benchmarking
 * Iterate over usize instead of u8 for used bits
 * Port to Windows
+* Implement handling of multiple threads.
+* When configured to be non-thread-safe, then detect usage with multiple threads,
+  and print stack traces showing where it was used in each thread.
+* Write unit tests / regression tests
