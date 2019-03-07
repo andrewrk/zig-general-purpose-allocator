@@ -197,7 +197,7 @@ const GeneralPurposeDebugAllocator = struct {
             .instruction_addresses = stack_addresses,
             .index = 0,
         };
-        std.debug.captureStackTrace(@ptrToInt(@returnAddress()), &stack_trace);
+        std.debug.captureStackTrace(@returnAddress(), &stack_trace);
 
         const result = (bucket.page + slot_index * size_class)[0..n];
         assert(result.len != 0);
