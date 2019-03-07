@@ -16,10 +16,13 @@ fn up_to_nearest_power_of_2(comptime T: type, n: T) T {
 // Number of stack frames to capture
 const stack_n = 4;
 
+const one_trace_size = @sizeOf(usize) * stack_n;
+const traces_per_slot = 2;
+
 // Bucket: In memory, in order:
 // * BucketHeader
 // * bucket_used_bits: [N]u8, // 1 bit for every slot; 1 byte for every 8 slots
-// * stack_trace_addresses: [N]usize, // 1 for every allocation
+// * stack_trace_addresses: [N]usize, // traces_per_slot for every allocation
 
 const BucketHeader = struct {
     prev: ?*BucketHeader,
@@ -36,23 +39,45 @@ const BucketHeader = struct {
         bucket: *BucketHeader,
         size_class: usize,
         slot_index: usize,
+        trace_kind: TraceKind,
     ) *[stack_n]usize {
         const start_ptr = @ptrCast([*]u8, bucket) + bucketStackFramesStart(size_class);
-        const one_trace_size = @sizeOf(usize) * stack_n;
-        const addr = start_ptr + one_trace_size * slot_index;
+        const addr = start_ptr + one_trace_size * traces_per_slot * slot_index +
+            @enumToInt(trace_kind) * usize(one_trace_size);
         return @ptrCast(*[stack_n]usize, addr);
     }
+
+    fn captureStackTrace(
+        bucket: *BucketHeader,
+        return_address: usize,
+        size_class: usize,
+        slot_index: usize,
+        trace_kind: TraceKind,
+    ) void {
+        // Initialize them to 0. When determining the count we must look
+        // for non zero addresses.
+        const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
+        std.mem.set(usize, stack_addresses, 0);
+        var stack_trace = builtin.StackTrace{
+            .instruction_addresses = stack_addresses,
+            .index = 0,
+        };
+        std.debug.captureStackTrace(return_address, &stack_trace);
+    }
+};
+
+const TraceKind = enum {
+    Alloc,
+    Free,
 };
 
 fn bucketStackTrace(
     bucket: *BucketHeader,
     size_class: usize,
     slot_index: usize,
+    trace_kind: TraceKind,
 ) builtin.StackTrace {
-    const stack_addresses = bucket.stackTracePtr(
-        size_class,
-        slot_index,
-    );
+    const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
     var len: usize = 0;
     while (len < stack_n and stack_addresses[len] != 0) {
         len += 1;
@@ -71,7 +96,7 @@ fn bucketStackFramesStart(size_class: usize) usize {
 }
 
 fn bucketSize(size_class: usize) usize {
-    return bucketStackFramesStart(size_class) + stack_n * @sizeOf(usize);
+    return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot;
 }
 
 fn usedBitsCount(size_class: usize) usize {
@@ -135,6 +160,7 @@ const GeneralPurposeDebugAllocator = struct {
                                 bucket,
                                 size_class,
                                 slot_index,
+                                TraceKind.Alloc,
                             );
                             std.debug.dumpStackTrace(stack_trace);
                         }
@@ -167,7 +193,7 @@ const GeneralPurposeDebugAllocator = struct {
 
             const bucket_size = bucketSize(size_class);
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            const bucket_addr = posix.mmap(null, page_size, perms, flags, -1, 0);
+            const bucket_addr = posix.mmap(null, aligned_bucket_size, perms, flags, -1, 0);
             if (bucket_addr == posix.MAP_FAILED) return error.OutOfMemory;
 
             const ptr = @intToPtr(*BucketHeader, bucket_addr);
@@ -200,16 +226,7 @@ const GeneralPurposeDebugAllocator = struct {
         used_bits_byte.* |= (u8(1) << used_bit_index);
 
         const slot_index = bucket.used_bits_index * 8 + used_bit_index;
-
-        // Initialize them to 0. When determining the count we must look
-        // for non zero addresses.
-        const stack_addresses = bucket.stackTracePtr(size_class, slot_index);
-        std.mem.set(usize, stack_addresses, 0);
-        var stack_trace = builtin.StackTrace{
-            .instruction_addresses = stack_addresses,
-            .index = 0,
-        };
-        std.debug.captureStackTrace(@returnAddress(), &stack_trace);
+        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Alloc);
 
         const result = (bucket.page + slot_index * size_class)[0..n];
         assert(result.len != 0);
@@ -247,11 +264,27 @@ const GeneralPurposeDebugAllocator = struct {
         const is_used = @truncate(u1, used_byte.* >> used_bit_index) != 0;
         if (!is_used) {
             // print allocation stack trace
-            const stack_trace = bucketStackTrace(bucket, size_class, slot_index);
             std.debug.warn("\nDouble free detected, allocated here:\n");
-            std.debug.dumpStackTrace(stack_trace);
+            const alloc_stack_trace = bucketStackTrace(
+                bucket,
+                size_class,
+                slot_index,
+                TraceKind.Alloc,
+            );
+            std.debug.dumpStackTrace(alloc_stack_trace);
+            std.debug.warn("\nFirst freed here:\n");
+            const free_stack_trace = bucketStackTrace(
+                bucket,
+                size_class,
+                slot_index,
+                TraceKind.Free,
+            );
+            std.debug.dumpStackTrace(free_stack_trace);
             @panic("\nSecond free here:");
         }
+        // Capture stack trace to be the "first free", in case a double free happens.
+        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Free);
+
         used_byte.* &= ~(u8(1) << used_bit_index);
         bucket.used_count -= 1;
         // TODO: if we freed the last slot, unmap the page

@@ -100,7 +100,6 @@ debug allocator will detect invalid thread usage with it.
 * Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
 * Handle the case when realloc sized down and free would find another bucket.
-* On double free, print the allocation stack trace, first free trace, and second free trace.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
 * Give memory back to the OS as often as possible. If a page can be unmapped then it
