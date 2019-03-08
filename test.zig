@@ -25,8 +25,8 @@ const traces_per_slot = 2;
 // * stack_trace_addresses: [N]usize, // traces_per_slot for every allocation
 
 const BucketHeader = struct {
-    prev: ?*BucketHeader,
-    next: ?*BucketHeader,
+    prev: *BucketHeader,
+    next: *BucketHeader,
     page: [*]align(page_size) u8,
     used_bits_index: usize,
     used_count: usize,
@@ -96,7 +96,8 @@ fn bucketStackFramesStart(size_class: usize) usize {
 }
 
 fn bucketSize(size_class: usize) usize {
-    return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot;
+    const slot_count = @divExact(page_size, size_class);
+    return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot * slot_count;
 }
 
 fn usedBitsCount(size_class: usize) usize {
@@ -182,35 +183,31 @@ const GeneralPurposeDebugAllocator = struct {
         if (n > (1 << (small_bucket_count - 1))) {
             return error.OutOfMemory;
         }
-        const size_class = std.math.max(up_to_nearest_power_of_2(usize, n), alignment);
-        const bucket_index = std.math.log2(size_class);
-        const bucket = self.buckets[bucket_index] orelse blk: {
-            const perms = posix.PROT_READ | posix.PROT_WRITE;
-            const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
-            const addr = posix.mmap(null, page_size, perms, flags, -1, 0);
-            if (addr == posix.MAP_FAILED) return error.OutOfMemory;
-            errdefer assert(posix.getErrno(posix.munmap(addr, page_size)) == 0);
-
-            const bucket_size = bucketSize(size_class);
-            const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            const bucket_addr = posix.mmap(null, aligned_bucket_size, perms, flags, -1, 0);
-            if (bucket_addr == posix.MAP_FAILED) return error.OutOfMemory;
-
-            const ptr = @intToPtr(*BucketHeader, bucket_addr);
-            ptr.* = BucketHeader{
-                .prev = null,
-                .next = null,
-                .page = @intToPtr([*]align(page_size) u8, addr),
-                .used_bits_index = 0,
-                .used_count = 0,
-            };
-            self.buckets[bucket_index] = ptr;
-            break :blk ptr;
-        };
-        if (bucket.used_count == usize(page_size) >> @intCast(u6, bucket_index)) {
-            // TODO: find available bucket, or allocate a new one
-            return error.OutOfMemory;
+        if (alignment != n) {
+            @panic("TODO: handle alignment != size");
         }
+        const size_class = up_to_nearest_power_of_2(usize, n);
+        const bucket_index = std.math.log2(size_class);
+        const first_bucket = self.buckets[bucket_index] orelse try self.createBucket(
+            size_class,
+            bucket_index,
+        );
+        var bucket = first_bucket;
+        while (bucket.used_count == usize(page_size) >> @intCast(u6, bucket_index)) {
+            const prev_bucket = bucket;
+            bucket = prev_bucket.next;
+            if (bucket == first_bucket) {
+                // make a new one
+                bucket = try self.createBucket(size_class, bucket_index);
+                bucket.prev = prev_bucket;
+                bucket.next = prev_bucket.next;
+                prev_bucket.next = bucket;
+                bucket.next.prev = bucket;
+            }
+        }
+        // change the allocator's current bucket to be this one
+        self.buckets[bucket_index] = bucket;
+
         bucket.used_count += 1;
         var used_bits_byte = bucket.usedBits(bucket.used_bits_index);
         while (used_bits_byte.* == 0xff) {
@@ -254,8 +251,18 @@ const GeneralPurposeDebugAllocator = struct {
         defer self.mprotect(posix.PROT_READ);
         const size_class = up_to_nearest_power_of_2(usize, bytes.len);
         const bucket_index = std.math.log2(size_class);
-        const bucket = self.buckets[bucket_index].?;
-        // right now alloc will not create more buckets so we assume that
+        const first_bucket = self.buckets[bucket_index].?;
+        var bucket = first_bucket;
+        while (true) {
+            const in_bucket_range = (@ptrToInt(bytes.ptr) >= @ptrToInt(bucket.page) and
+                @ptrToInt(bytes.ptr) < @ptrToInt(bucket.page) + page_size);
+            if (in_bucket_range) break;
+            bucket = bucket.prev;
+            if (bucket == first_bucket) {
+                @panic("Invalid free");
+            }
+            self.buckets[bucket_index] = bucket;
+        }
         const byte_offset = @ptrToInt(bytes.ptr) - @ptrToInt(bucket.page);
         const slot_index = byte_offset / size_class;
         const used_byte_index = slot_index / 8;
@@ -287,7 +294,48 @@ const GeneralPurposeDebugAllocator = struct {
 
         used_byte.* &= ~(u8(1) << used_bit_index);
         bucket.used_count -= 1;
-        // TODO: if we freed the last slot, unmap the page
+        if (bucket.used_count == 0) {
+            if (bucket.next == bucket) {
+                // it's the only bucket and therefore the current one
+                self.buckets[bucket_index] = null;
+            } else {
+                bucket.next.prev = bucket.prev;
+                bucket.prev.next = bucket.next;
+                self.buckets[bucket_index] = bucket.prev;
+            }
+            _ = os.posix.munmap(@ptrToInt(bucket.page), page_size);
+            const bucket_size = bucketSize(size_class);
+            const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
+            _ = os.posix.munmap(@ptrToInt(bucket), aligned_bucket_size);
+        }
+    }
+
+    fn createBucket(
+        self: *GeneralPurposeDebugAllocator,
+        size_class: usize,
+        bucket_index: usize,
+    ) error{OutOfMemory}!*BucketHeader {
+        const perms = posix.PROT_READ | posix.PROT_WRITE;
+        const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
+        const addr = posix.mmap(null, page_size, perms, flags, -1, 0);
+        if (addr == posix.MAP_FAILED) return error.OutOfMemory;
+        errdefer assert(posix.getErrno(posix.munmap(addr, page_size)) == 0);
+
+        const bucket_size = bucketSize(size_class);
+        const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
+        const bucket_addr = posix.mmap(null, aligned_bucket_size, perms, flags, -1, 0);
+        if (bucket_addr == posix.MAP_FAILED) return error.OutOfMemory;
+
+        const ptr = @intToPtr(*BucketHeader, bucket_addr);
+        ptr.* = BucketHeader{
+            .prev = ptr,
+            .next = ptr,
+            .page = @intToPtr([*]align(page_size) u8, addr),
+            .used_bits_index = 0,
+            .used_count = 0,
+        };
+        self.buckets[bucket_index] = ptr;
+        return ptr;
     }
 };
 
@@ -324,4 +372,29 @@ test "double free" {
 
     allocator.destroy(alloc1);
     allocator.destroy(alloc1);
+}
+
+test "use a lot of memory" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    //defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    std.debug.warn("\n");
+
+    var list = std.ArrayList(*u64).init(std.debug.global_allocator);
+
+    var i: usize = 0;
+    while (i < 513) : (i += 1) {
+        const ptr = try allocator.create(u64);
+        try list.append(ptr);
+        //std.debug.warn("{} = {*}\n", i, ptr);
+    }
+
+    for (list.toSlice()) |ptr| {
+        allocator.destroy(ptr);
+    }
+    //while (list.popOrNull()) |ptr| {
+    //    //std.debug.warn("free {*}\n", ptr);
+    //    allocator.destroy(ptr);
+    //}
 }

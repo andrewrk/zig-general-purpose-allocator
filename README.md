@@ -97,7 +97,6 @@ debug allocator will detect invalid thread usage with it.
 
 ## Roadmap
 
-* Make it support allocations after one page is exhausted
 * Make it support allocations larger than what fits in the small allocation buckets
 * Handle the case when realloc sized down and free would find another bucket.
 * Make allocations favor iterating forward over slots. Favor using new slots in
@@ -117,3 +116,4 @@ debug allocator will detect invalid thread usage with it.
 * When configured to be non-thread-safe, then detect usage with multiple threads,
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
+* Ability to specify maximum memory usage before returning OutOfMemory
