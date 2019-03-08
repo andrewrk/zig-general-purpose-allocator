@@ -376,10 +376,8 @@ test "double free" {
 
 test "use a lot of memory" {
     const gpda = try GeneralPurposeDebugAllocator.create();
-    //defer gpda.destroy();
+    defer gpda.destroy();
     const allocator = &gpda.allocator;
-
-    std.debug.warn("\n");
 
     var list = std.ArrayList(*u64).init(std.debug.global_allocator);
 
@@ -398,3 +396,17 @@ test "use a lot of memory" {
     //    allocator.destroy(ptr);
     //}
 }
+
+test "invalid free" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    std.debug.warn("\n");
+
+    const alloc1 = try allocator.create(i32);
+    std.debug.warn("alloc1 = {}\n", alloc1);
+
+    allocator.destroy(@intToPtr(*i32, 0x12345));
+}
+

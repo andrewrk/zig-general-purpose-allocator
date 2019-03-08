@@ -15,8 +15,7 @@ into the [Zig](https://ziglang.org/) standard library, with the focus on these g
  * Detect leaks and print stack trace of:
    - Where it was allocated
 
- * Ideally, freed memory would be unmapped so that it
-   would cause page faults if used.
+ * Unmap freed memory as soon as possible to cause page faults when used.
 
  * Make pointer math errors unlikely to harm memory from
    unrelated allocations
@@ -27,6 +26,15 @@ into the [Zig](https://ziglang.org/) standard library, with the focus on these g
  * OK for performance cost for these mechanisms.
 
  * Rogue memory writes should not harm the allocator's state.
+
+ * Cross platform. Allowed to take advatage of a specific operating system's
+   features, but should work everywhere, even freestanding, by wrapping an
+   existing allocator.
+
+ * Compile-time configuration, including:
+   - Whether the allocatior is to be thread-safe. If thread-safety is disabled,
+     then the debug allocator will detect invalid thread usage with it.
+   - How many stack frames to collect.
 
 ## Goals for Other General Purpose Allocators But Not This One
 
@@ -48,14 +56,16 @@ ReleaseSafe Mode:
 
 ## Current Status
 
-POSIX-only so far.
+ * POSIX-only
+ * Only supports allocations less than one page of memory
 
-Able to detect memory leaks:
+Memory leak detection:
 
 ![](https://i.imgur.com/KufxrKm.png)
 
-Only able to allocate 1 memory page per bucket, and does not support
-large allocations.
+Double free detection:
+
+![](https://i.imgur.com/5M5xS95.png)
 
 ### Current Design
 
@@ -77,11 +87,14 @@ index obj_size
 11    2048
 ```
 
-Each bucket starts with no pages allocated. When the first object is allocated
-for a given bucket, it allocates 1 page of memory from the OS. This page is
+The main allocator state has an array of all the "current" buckets for each
+size class. Each slot in the array can be null, meaning the bucket for that
+size class is not allocated. When the first object is allocated for a given
+size class, it allocates 1 page of memory from the OS. This page is
 divided into "slots" - one per allocated object. Along with the page of memory
 for object slots, as many pages as necessary are allocated to store the
-BucketHeader, followed by "used bits", and a stack trace for each slot.
+BucketHeader, followed by "used bits", and two stack traces for each slot
+(allocation trace and free trace).
 
 The "used bits" are 1 bit per slot representing whether the slot is used.
 Allocations use the data to iterate to find a free slot. Frees assert that the
@@ -89,20 +102,23 @@ corresponding bit is 1 and set it to 0.
 
 The memory for the allocator goes on its own page, with no write permissions.
 On call to alloc and free, the allocator uses mprotect to make its own state
-writable, and then removes write permissions before returning.
+writable, and then removes write permissions before returning. However bucket
+metadata is not protected in this way yet.
 
-There are comptime configuration parameters. One of them is whether or not
-the allocator should be thread-safe. If thread-safety is disabled, then the
-debug allocator will detect invalid thread usage with it.
+Buckets have prev and next pointers. When there is only one bucket for a given
+size class, both prev and next point to itself. When all slots of a bucket are
+used, a new bucket is allocated, and enters the doubly linked list. The main
+allocator state tracks the "current" bucket for each size class.
 
 ## Roadmap
 
+* Scan all buckets when detecting leaks.
 * Make it support allocations larger than what fits in the small allocation buckets
 * Handle the case when realloc sized down and free would find another bucket.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
-* Give memory back to the OS as often as possible. If a page can be unmapped then it
-  should be unmapped.
+* On invalid free, print nearest allocation/deallocation stack trace
+* Do the memory protection for bucket metadata too
 * Catch the error when wrong n or wrong alignment is given to free or realloc/shrink.
 * Ability to print stats
   * Requested Bytes Allocated (total of n for every alloc minus n for every free)
@@ -110,6 +126,7 @@ debug allocator will detect invalid thread usage with it.
   * Overhead Bytes (how much memory the allocator state is using)
 * Validation fuzz testing
 * Performance benchmarking
+  * Do we need meta-buckets?
 * Iterate over usize instead of u8 for used bits
 * Port to Windows
 * Implement handling of multiple threads.
@@ -117,3 +134,4 @@ debug allocator will detect invalid thread usage with it.
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
 * Ability to specify maximum memory usage before returning OutOfMemory
+* Port to freestanding / support backing allocator rather than OS API
