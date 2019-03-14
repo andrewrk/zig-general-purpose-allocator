@@ -113,7 +113,6 @@ allocator state tracks the "current" bucket for each size class.
 ## Roadmap
 
 * Scan all buckets when detecting leaks.
-* Make it support allocations larger than what fits in the small allocation buckets
 * Handle the case when realloc sized down and free would find another bucket.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.

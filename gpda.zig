@@ -105,19 +105,113 @@ fn usedBitsCount(size_class: usize) usize {
     return @divExact(slot_count, 8);
 }
 
+fn hash_addr(addr: usize) u32 {
+    // TODO ignore the least significant bits because addr is guaranteed
+    // to be page aligned
+    if (@sizeOf(usize) == @sizeOf(u32))
+        return addr;
+    comptime assert(@sizeOf(usize) == 8);
+    return @intCast(u32, addr >> 32) ^ @truncate(u32, addr);
+}
+
+fn eql_addr(a: usize, b: usize) bool {
+    return a == b;
+}
+
+fn sysAlloc(len: usize) error{OutOfMemory}![]align(page_size) u8 {
+    const perms = posix.PROT_READ | posix.PROT_WRITE;
+    const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
+    const addr = posix.mmap(null, len, perms, flags, -1, 0);
+    if (addr == posix.MAP_FAILED) return error.OutOfMemory;
+    return @intToPtr([*]align(page_size) u8, addr)[0..len];
+}
+
+fn sysFree(old_mem: []u8) void {
+    assert(posix.getErrno(posix.munmap(@ptrToInt(old_mem.ptr), old_mem.len)) == 0);
+}
+
+const SimpleAllocator = struct {
+    allocator: Allocator,
+    active_allocation: []u8,
+
+    fn init() SimpleAllocator {
+        return SimpleAllocator{
+            .allocator = Allocator{
+                .allocFn = alloc,
+                .reallocFn = realloc,
+                .freeFn = free,
+            },
+            .active_allocation = (([*]u8)(undefined))[0..0],
+        };
+    }
+
+    fn deinit(self: SimpleAllocator) void {
+        if (self.active_allocation.len == 0) return;
+        sysFree(self.active_allocation);
+    }
+
+    fn alloc(allocator: *Allocator, n: usize, alignment: u29) error{OutOfMemory}![]u8 {
+        const self = @fieldParentPtr(SimpleAllocator, "allocator", allocator);
+        const result = try sysAlloc(n);
+        self.active_allocation = result;
+        return result;
+    }
+
+    fn realloc(
+        allocator: *Allocator,
+        old_mem: []u8,
+        new_size: usize,
+        alignment: u29,
+    ) error{OutOfMemory}![]u8 {
+        // HashMap never calls realloc.
+        unreachable;
+    }
+
+    fn free(allocator: *Allocator, bytes: []u8) void {
+        sysFree(bytes);
+    }
+
+    /// Applies to all of the bytes in the entire allocator.
+    pub fn mprotect(self: *SimpleAllocator, protection: u32) void {
+        if (self.active_allocation.len == 0) return;
+        os.posixMProtect(
+            @ptrToInt(self.active_allocation.ptr),
+            std.mem.alignForward(self.active_allocation.len, page_size),
+            protection,
+        ) catch unreachable;
+    }
+};
+
 const GeneralPurposeDebugAllocator = struct {
     allocator: Allocator,
     buckets: [small_bucket_count]?*BucketHeader,
+    simple_allocator: SimpleAllocator,
+    large_allocations: LargeAllocTable,
 
     const small_bucket_count = std.math.log2(page_size);
+    const largest_bucket_object_size = 1 << (small_bucket_count - 1);
+
+    const LargeAlloc = struct {
+        bytes: []u8,
+        stack_addresses: [stack_n]usize,
+
+        fn dumpStackTrace(self: *LargeAlloc) void {
+            var len: usize = 0;
+            while (len < stack_n and self.stack_addresses[len] != 0) {
+                len += 1;
+            }
+            const stack_trace = builtin.StackTrace{
+                .instruction_addresses = &self.stack_addresses,
+                .index = len,
+            };
+            std.debug.dumpStackTrace(stack_trace);
+        }
+    };
+    const LargeAllocTable = std.HashMap(usize, LargeAlloc, hash_addr, eql_addr);
 
     pub fn create() !*GeneralPurposeDebugAllocator {
-        comptime assert(page_size >= @sizeOf(GeneralPurposeDebugAllocator));
-        const perms = posix.PROT_READ | posix.PROT_WRITE;
-        const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
-        const addr = posix.mmap(null, page_size, perms, flags, -1, 0);
-        if (addr == posix.MAP_FAILED) return error.OutOfMemory;
-        const self = @intToPtr(*GeneralPurposeDebugAllocator, addr);
+        const self_bytes = try sysAlloc(@sizeOf(GeneralPurposeDebugAllocator));
+        const self = @ptrCast(*GeneralPurposeDebugAllocator, self_bytes.ptr);
         self.* = GeneralPurposeDebugAllocator{
             .allocator = Allocator{
                 .allocFn = alloc,
@@ -125,6 +219,8 @@ const GeneralPurposeDebugAllocator = struct {
                 .freeFn = free,
             },
             .buckets = [1]?*BucketHeader{null} ** small_bucket_count,
+            .simple_allocator = SimpleAllocator.init(),
+            .large_allocations = LargeAllocTable.init(&self.simple_allocator.allocator),
         };
         try self.mprotectInit(posix.PROT_READ);
         return self;
@@ -171,8 +267,69 @@ const GeneralPurposeDebugAllocator = struct {
                 }
             }
         }
-        const err = posix.munmap(@ptrToInt(self), page_size);
-        assert(posix.getErrno(err) == 0);
+        var large_it = self.large_allocations.iterator();
+        while (large_it.next()) |large_alloc| {
+            std.debug.warn("\nMemory leak detected:\n");
+            large_alloc.value.dumpStackTrace();
+        }
+        self.simple_allocator.deinit(); // Free large_allocations memory.
+        sysFree(@ptrCast([*]u8, self)[0..@sizeOf(GeneralPurposeDebugAllocator)]);
+    }
+
+    fn directAlloc(
+        self: *GeneralPurposeDebugAllocator,
+        n: usize,
+        alignment: u29,
+        first_trace_addr: usize,
+    ) error{OutOfMemory}![]u8 {
+        const p = posix;
+        const alloc_size = if (alignment <= os.page_size) n else n + alignment;
+        const slice = try sysAlloc(alloc_size);
+        errdefer sysFree(slice);
+
+        if (alloc_size == n) {
+            try self.trackLargeAlloc(slice, first_trace_addr);
+            return slice;
+        }
+
+        const addr = @ptrToInt(slice.ptr);
+        const aligned_addr = std.mem.alignForward(addr, alignment);
+
+        // We can unmap the unused portions of our mmap, but we must only
+        // pass munmap bytes that exist outside our allocated pages or it
+        // will happily eat us too.
+
+        // Since alignment > page_size, we are by definition on a page boundary.
+        const unused_len = aligned_addr - 1 - addr;
+
+        sysFree(slice[0..unused_len]);
+
+        // It is impossible that there is an unoccupied page at the top of our
+        // mmap.
+        const result = @intToPtr([*]u8, aligned_addr)[0..n];
+        try self.trackLargeAlloc(result, first_trace_addr);
+        return result;
+    }
+
+    fn trackLargeAlloc(
+        self: *GeneralPurposeDebugAllocator,
+        bytes: []u8,
+        first_trace_addr: usize,
+    ) !void {
+        self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+        defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+        const gop = try self.large_allocations.getOrPut(@ptrToInt(bytes.ptr));
+        if (gop.found_existing) {
+            @panic("OS provided unexpected memory address");
+        }
+        gop.kv.value.bytes = bytes;
+        std.mem.set(usize, &gop.kv.value.stack_addresses, 0);
+        var stack_trace = builtin.StackTrace{
+            .instruction_addresses = &gop.kv.value.stack_addresses,
+            .index = 0,
+        };
+        std.debug.captureStackTrace(first_trace_addr, &stack_trace);
     }
 
     fn alloc(allocator: *Allocator, n: usize, alignment: u29) error{OutOfMemory}![]u8 {
@@ -180,8 +337,8 @@ const GeneralPurposeDebugAllocator = struct {
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
 
-        if (n > (1 << (small_bucket_count - 1))) {
-            return error.OutOfMemory;
+        if (n > largest_bucket_object_size) {
+            return self.directAlloc(n, alignment, @returnAddress());
         }
         if (alignment != n) {
             @panic("TODO: handle alignment != size");
@@ -245,10 +402,33 @@ const GeneralPurposeDebugAllocator = struct {
         return new_mem;
     }
 
+    fn directFree(self: *GeneralPurposeDebugAllocator, bytes: []u8) void {
+        self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+        defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+        const kv = self.large_allocations.get(@ptrToInt(bytes.ptr)).?;
+        if (bytes.len != kv.value.bytes.len) {
+            std.debug.warn(
+                "\nAllocation size {} bytes does not match free size {}. Allocated here:\n",
+                kv.value.bytes.len,
+                bytes.len,
+            );
+            kv.value.dumpStackTrace();
+
+            @panic("\nFree here:");
+        }
+
+        assert(self.large_allocations.remove(@ptrToInt(bytes.ptr)) != null);
+        sysFree(bytes);
+    }
+
     fn free(allocator: *Allocator, bytes: []u8) void {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
+        if (bytes.len > largest_bucket_object_size) {
+            return self.directFree(bytes);
+        }
         const size_class = up_to_nearest_power_of_2(usize, bytes.len);
         const bucket_index = std.math.log2(size_class);
         const first_bucket = self.buckets[bucket_index].?;
@@ -279,7 +459,7 @@ const GeneralPurposeDebugAllocator = struct {
                 TraceKind.Alloc,
             );
             std.debug.dumpStackTrace(alloc_stack_trace);
-            std.debug.warn("\nFirst freed here:\n");
+            std.debug.warn("\nFirst free here:\n");
             const free_stack_trace = bucketStackTrace(
                 bucket,
                 size_class,
@@ -303,10 +483,10 @@ const GeneralPurposeDebugAllocator = struct {
                 bucket.prev.next = bucket.next;
                 self.buckets[bucket_index] = bucket.prev;
             }
-            _ = os.posix.munmap(@ptrToInt(bucket.page), page_size);
+            sysFree(bucket.page[0..page_size]);
             const bucket_size = bucketSize(size_class);
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            _ = os.posix.munmap(@ptrToInt(bucket), aligned_bucket_size);
+            sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
         }
     }
 
@@ -315,22 +495,17 @@ const GeneralPurposeDebugAllocator = struct {
         size_class: usize,
         bucket_index: usize,
     ) error{OutOfMemory}!*BucketHeader {
-        const perms = posix.PROT_READ | posix.PROT_WRITE;
-        const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
-        const addr = posix.mmap(null, page_size, perms, flags, -1, 0);
-        if (addr == posix.MAP_FAILED) return error.OutOfMemory;
-        errdefer assert(posix.getErrno(posix.munmap(addr, page_size)) == 0);
+        const page = try sysAlloc(page_size);
+        errdefer sysFree(page);
 
         const bucket_size = bucketSize(size_class);
         const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-        const bucket_addr = posix.mmap(null, aligned_bucket_size, perms, flags, -1, 0);
-        if (bucket_addr == posix.MAP_FAILED) return error.OutOfMemory;
-
-        const ptr = @intToPtr(*BucketHeader, bucket_addr);
+        const bucket_bytes = try sysAlloc(aligned_bucket_size);
+        const ptr = @ptrCast(*BucketHeader, bucket_bytes.ptr);
         ptr.* = BucketHeader{
             .prev = ptr,
             .next = ptr,
-            .page = @intToPtr([*]align(page_size) u8, addr),
+            .page = page.ptr,
             .used_bits_index = 0,
             .used_count = 0,
         };
@@ -339,42 +514,7 @@ const GeneralPurposeDebugAllocator = struct {
     }
 };
 
-test "leaks" {
-    const gpda = try GeneralPurposeDebugAllocator.create();
-    defer gpda.destroy();
-    const allocator = &gpda.allocator;
-
-    std.debug.warn("\n");
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        const alloc1 = try allocator.create(i32);
-        std.debug.warn("alloc1 = {}\n", alloc1);
-        defer allocator.destroy(alloc1);
-
-        const alloc2 = try allocator.create(i32);
-        std.debug.warn("alloc2 = {}\n", alloc2);
-        //defer allocator.destroy(alloc2);
-    }
-}
-
-test "double free" {
-    const gpda = try GeneralPurposeDebugAllocator.create();
-    defer gpda.destroy();
-    const allocator = &gpda.allocator;
-
-    std.debug.warn("\n");
-
-    const alloc1 = try allocator.create(i32);
-    std.debug.warn("alloc1 = {}\n", alloc1);
-
-    const alloc2 = try allocator.create(i32);
-    std.debug.warn("alloc2 = {}\n", alloc2);
-
-    allocator.destroy(alloc1);
-    allocator.destroy(alloc1);
-}
-
-test "use a lot of memory" {
+test "small allocations - free in same order" {
     const gpda = try GeneralPurposeDebugAllocator.create();
     defer gpda.destroy();
     const allocator = &gpda.allocator;
@@ -385,28 +525,40 @@ test "use a lot of memory" {
     while (i < 513) : (i += 1) {
         const ptr = try allocator.create(u64);
         try list.append(ptr);
-        //std.debug.warn("{} = {*}\n", i, ptr);
     }
 
     for (list.toSlice()) |ptr| {
         allocator.destroy(ptr);
     }
-    //while (list.popOrNull()) |ptr| {
-    //    //std.debug.warn("free {*}\n", ptr);
-    //    allocator.destroy(ptr);
-    //}
 }
 
-test "invalid free" {
+test "small allocations - free in reverse order" {
     const gpda = try GeneralPurposeDebugAllocator.create();
     defer gpda.destroy();
     const allocator = &gpda.allocator;
 
-    std.debug.warn("\n");
+    var list = std.ArrayList(*u64).init(std.debug.global_allocator);
 
-    const alloc1 = try allocator.create(i32);
-    std.debug.warn("alloc1 = {}\n", alloc1);
+    var i: usize = 0;
+    while (i < 513) : (i += 1) {
+        const ptr = try allocator.create(u64);
+        try list.append(ptr);
+    }
 
-    allocator.destroy(@intToPtr(*i32, 0x12345));
+    while (list.popOrNull()) |ptr| {
+        allocator.destroy(ptr);
+    }
 }
 
+test "large allocations" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    const ptr1 = try allocator.alloc(u64, 42768);
+    const ptr2 = try allocator.alloc(u64, 52768);
+    allocator.free(ptr1);
+    const ptr3 = try allocator.alloc(u64, 62768);
+    allocator.free(ptr3);
+    allocator.free(ptr2);
+}
