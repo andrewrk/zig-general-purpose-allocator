@@ -137,9 +137,8 @@ const SimpleAllocator = struct {
     fn init() SimpleAllocator {
         return SimpleAllocator{
             .allocator = Allocator{
-                .allocFn = alloc,
                 .reallocFn = realloc,
-                .freeFn = free,
+                .shrinkFn = shrink,
             },
             .active_allocation = (([*]u8)(undefined))[0..0],
         };
@@ -150,25 +149,31 @@ const SimpleAllocator = struct {
         sysFree(self.active_allocation);
     }
 
-    fn alloc(allocator: *Allocator, n: usize, alignment: u29) error{OutOfMemory}![]u8 {
+    fn realloc(
+        allocator: *Allocator,
+        old_mem: []u8,
+        old_alignment: u29,
+        new_size: usize,
+        new_alignment: u29,
+    ) error{OutOfMemory}![]u8 {
+        assert(old_mem.len == 0);
+        assert(new_alignment < page_size);
         const self = @fieldParentPtr(SimpleAllocator, "allocator", allocator);
-        const result = try sysAlloc(n);
+        const result = try sysAlloc(new_size);
         self.active_allocation = result;
         return result;
     }
 
-    fn realloc(
+    fn shrink(
         allocator: *Allocator,
         old_mem: []u8,
+        old_alignment: u29,
         new_size: usize,
-        alignment: u29,
-    ) error{OutOfMemory}![]u8 {
-        // HashMap never calls realloc.
-        unreachable;
-    }
-
-    fn free(allocator: *Allocator, bytes: []u8) void {
-        sysFree(bytes);
+        new_alignment: u29,
+    ) []u8 {
+        assert(new_size == 0);
+        sysFree(old_mem);
+        return old_mem[0..0];
     }
 
     /// Applies to all of the bytes in the entire allocator.
@@ -214,9 +219,8 @@ const GeneralPurposeDebugAllocator = struct {
         const self = @ptrCast(*GeneralPurposeDebugAllocator, self_bytes.ptr);
         self.* = GeneralPurposeDebugAllocator{
             .allocator = Allocator{
-                .allocFn = alloc,
                 .reallocFn = realloc,
-                .freeFn = free,
+                .shrinkFn = shrink,
             },
             .buckets = [1]?*BucketHeader{null} ** small_bucket_count,
             .simple_allocator = SimpleAllocator.init(),
@@ -390,12 +394,14 @@ const GeneralPurposeDebugAllocator = struct {
     fn realloc(
         allocator: *Allocator,
         old_mem: []u8,
+        old_align: u29,
         new_size: usize,
         alignment: u29,
     ) error{OutOfMemory}![]u8 {
         //const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         if (new_size <= old_mem.len) {
-            return old_mem[0..new_size];
+            // TODO determine when we can handle this situation better
+            return error.OutOfMemory;
         }
         const new_mem = try alloc(allocator, new_size, alignment);
         @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
@@ -418,16 +424,28 @@ const GeneralPurposeDebugAllocator = struct {
             @panic("\nFree here:");
         }
 
+        // TODO we should be able to replace the above call to get() with remove()
+        // is it a hash table bug?
         assert(self.large_allocations.remove(@ptrToInt(bytes.ptr)) != null);
         sysFree(bytes);
     }
 
-    fn free(allocator: *Allocator, bytes: []u8) void {
+    fn shrink(
+        allocator: *Allocator,
+        bytes: []u8,
+        old_align: u29,
+        new_size: usize,
+        new_alignment: u29,
+    ) []u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
+        if (new_size > 0) {
+            @panic("TODO handle shrink to nonzero");
+        }
         if (bytes.len > largest_bucket_object_size) {
-            return self.directFree(bytes);
+            self.directFree(bytes);
+            return bytes[0..0];
         }
         const size_class = up_to_nearest_power_of_2(usize, bytes.len);
         const bucket_index = std.math.log2(size_class);
@@ -488,6 +506,7 @@ const GeneralPurposeDebugAllocator = struct {
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
             sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
         }
+        return bytes[0..0];
     }
 
     fn createBucket(
