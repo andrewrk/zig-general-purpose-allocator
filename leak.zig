@@ -1,5 +1,5 @@
 const std = @import("std");
-const GeneralPurposeDebugAllocator = @import("gpda.zig");
+const GeneralPurposeDebugAllocator = @import("gpda.zig").GeneralPurposeDebugAllocator;
 
 test "leaks" {
     const gpda = try GeneralPurposeDebugAllocator.create();
