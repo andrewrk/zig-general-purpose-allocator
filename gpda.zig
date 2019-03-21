@@ -193,6 +193,8 @@ pub const GeneralPurposeDebugAllocator = struct {
     simple_allocator: SimpleAllocator,
     large_allocations: LargeAllocTable,
 
+    pub const Error = std.mem.Allocator.Error;
+
     const small_bucket_count = std.math.log2(page_size);
     const largest_bucket_object_size = 1 << (small_bucket_count - 1);
 
@@ -285,7 +287,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         n: usize,
         alignment: u29,
         first_trace_addr: usize,
-    ) error{OutOfMemory}![]u8 {
+    ) Error![]u8 {
         const p = posix;
         const alloc_size = if (alignment <= os.page_size) n else n + alignment;
         const slice = try sysAlloc(alloc_size);
@@ -336,16 +338,11 @@ pub const GeneralPurposeDebugAllocator = struct {
         std.debug.captureStackTrace(first_trace_addr, &stack_trace);
     }
 
-    inline fn alloc(allocator: *Allocator, byte_count: usize, alignment: u29) error{OutOfMemory}![]u8 {
-        const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
-        self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-        defer self.mprotect(posix.PROT_READ);
-
-        const aligned_size = std.math.max(byte_count, alignment);
-        if (aligned_size > largest_bucket_object_size) {
-            return self.directAlloc(byte_count, alignment, @returnAddress());
-        }
-        const size_class = up_to_nearest_power_of_2(usize, aligned_size);
+    fn allocSlot(
+        self: *GeneralPurposeDebugAllocator,
+        size_class: usize,
+        trace_addr: usize,
+    ) Error![*]u8 {
         const bucket_index = std.math.log2(size_class);
         const first_bucket = self.buckets[bucket_index] orelse try self.createBucket(
             size_class,
@@ -382,11 +379,9 @@ pub const GeneralPurposeDebugAllocator = struct {
         used_bits_byte.* |= (u8(1) << used_bit_index);
 
         const slot_index = bucket.used_bits_index * 8 + used_bit_index;
-        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Alloc);
+        bucket.captureStackTrace(trace_addr, size_class, slot_index, TraceKind.Alloc);
 
-        const result = (bucket.page + slot_index * size_class)[0..byte_count];
-        assert(result.len != 0);
-        return result;
+        return bucket.page + slot_index * size_class;
     }
 
     fn reallocLarge(
@@ -395,7 +390,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         old_align: u29,
         new_size: usize,
         alignment: u29,
-    ) error{OutOfMemory}![]u8 {
+    ) Error![]u8 {
         @panic("TODO handle realloc of large object");
     }
 
@@ -418,25 +413,65 @@ pub const GeneralPurposeDebugAllocator = struct {
         }
     }
 
+    fn freeSlot(
+        self: *GeneralPurposeDebugAllocator,
+        bucket: *BucketHeader,
+        bucket_index: usize,
+        size_class: usize,
+        slot_index: usize,
+        used_byte: *u8,
+        used_bit_index: u3,
+        trace_addr: usize,
+    ) void {
+        // Capture stack trace to be the "first free", in case a double free happens.
+        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Free);
+
+        used_byte.* &= ~(u8(1) << used_bit_index);
+        bucket.used_count -= 1;
+        if (bucket.used_count == 0) {
+            if (bucket.next == bucket) {
+                // it's the only bucket and therefore the current one
+                self.buckets[bucket_index] = null;
+            } else {
+                bucket.next.prev = bucket.prev;
+                bucket.prev.next = bucket.next;
+                self.buckets[bucket_index] = bucket.prev;
+            }
+            sysFree(bucket.page[0..page_size]);
+            const bucket_size = bucketSize(size_class);
+            const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
+            sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
+        }
+    }
+
     fn realloc(
         allocator: *Allocator,
         old_mem: []u8,
         old_align: u29,
         new_size: usize,
         new_align: u29,
-    ) error{OutOfMemory}![]u8 {
-        if (old_mem.len == 0) {
-            return alloc(allocator, new_size, new_align);
-        }
+    ) Error![]u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
+
+        if (old_mem.len == 0) {
+            const new_aligned_size = std.math.max(new_size, new_align);
+            if (new_aligned_size > largest_bucket_object_size) {
+                return self.directAlloc(new_size, new_align, @returnAddress());
+            } else {
+                const new_size_class = up_to_nearest_power_of_2(usize, new_aligned_size);
+                const ptr = try self.allocSlot(new_size_class, @returnAddress());
+                return ptr[0..new_size];
+            }
+        }
 
         const aligned_size = std.math.max(old_mem.len, old_align);
         if (aligned_size > largest_bucket_object_size) {
             return self.reallocLarge(old_mem, old_align, new_size, new_align);
         }
         const size_class = up_to_nearest_power_of_2(usize, aligned_size);
+
         var bucket_index = std.math.log2(size_class);
         const bucket = while (bucket_index < small_bucket_count) : (bucket_index += 1) {
             if (self.searchBucket(bucket_index, @ptrToInt(old_mem.ptr))) |bucket| {
@@ -472,25 +507,15 @@ pub const GeneralPurposeDebugAllocator = struct {
             @panic("\nSecond free here:");
         }
         if (new_size == 0) {
-            // Capture stack trace to be the "first free", in case a double free happens.
-            bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Free);
-
-            used_byte.* &= ~(u8(1) << used_bit_index);
-            bucket.used_count -= 1;
-            if (bucket.used_count == 0) {
-                if (bucket.next == bucket) {
-                    // it's the only bucket and therefore the current one
-                    self.buckets[bucket_index] = null;
-                } else {
-                    bucket.next.prev = bucket.prev;
-                    bucket.prev.next = bucket.next;
-                    self.buckets[bucket_index] = bucket.prev;
-                }
-                sysFree(bucket.page[0..page_size]);
-                const bucket_size = bucketSize(size_class);
-                const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-                sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
-            }
+            self.freeSlot(
+                bucket,
+                bucket_index,
+                size_class,
+                slot_index,
+                used_byte,
+                used_bit_index,
+                @returnAddress(),
+            );
             return old_mem[0..0];
         }
         const new_aligned_size = std.math.max(new_size, new_align);
@@ -501,7 +526,18 @@ pub const GeneralPurposeDebugAllocator = struct {
         if (new_size_class > largest_bucket_object_size) {
             @panic("realloc moving from buckets to non buckets");
         }
-        @panic("TODO deal with moving across size classes");
+        const ptr = try self.allocSlot(new_size_class, @returnAddress());
+        @memcpy(ptr, old_mem.ptr, old_mem.len);
+        self.freeSlot(
+            bucket,
+            bucket_index,
+            size_class,
+            slot_index,
+            used_byte,
+            used_bit_index,
+            @returnAddress(),
+        );
+        return ptr[0..new_size];
     }
 
     fn directFree(self: *GeneralPurposeDebugAllocator, bytes: []u8) void {
@@ -575,25 +611,15 @@ pub const GeneralPurposeDebugAllocator = struct {
             std.debug.dumpStackTrace(free_stack_trace);
             @panic("\nSecond free here:");
         }
-        // Capture stack trace to be the "first free", in case a double free happens.
-        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Free);
-
-        used_byte.* &= ~(u8(1) << used_bit_index);
-        bucket.used_count -= 1;
-        if (bucket.used_count == 0) {
-            if (bucket.next == bucket) {
-                // it's the only bucket and therefore the current one
-                self.buckets[bucket_index] = null;
-            } else {
-                bucket.next.prev = bucket.prev;
-                bucket.prev.next = bucket.next;
-                self.buckets[bucket_index] = bucket.prev;
-            }
-            sysFree(bucket.page[0..page_size]);
-            const bucket_size = bucketSize(size_class);
-            const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
-        }
+        self.freeSlot(
+            bucket,
+            bucket_index,
+            size_class,
+            slot_index,
+            used_byte,
+            used_bit_index,
+            @returnAddress(),
+        );
         return old_mem[0..0];
     }
 
@@ -601,7 +627,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         self: *GeneralPurposeDebugAllocator,
         size_class: usize,
         bucket_index: usize,
-    ) error{OutOfMemory}!*BucketHeader {
+    ) Error!*BucketHeader {
         const page = try sysAlloc(page_size);
         errdefer sysFree(page);
 
@@ -677,9 +703,17 @@ test "realloc" {
 
     var slice = try allocator.alignedAlloc(u8, @alignOf(u32), 1);
     defer allocator.free(slice);
+    slice[0] = 0x12;
 
     // This reallocation should keep its pointer address.
     const old_slice = slice;
     slice = try allocator.realloc(slice, 2);
     assert(old_slice.ptr == slice.ptr);
+    assert(slice[0] == 0x12);
+    slice[1] = 0x34;
+
+    // This requires upgrading to a larger size class
+    slice = try allocator.realloc(slice, 17);
+    assert(slice[0] == 0x12);
+    assert(slice[1] == 0x34);
 }
