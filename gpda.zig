@@ -152,7 +152,7 @@ const SimpleAllocator = struct {
     fn realloc(
         allocator: *Allocator,
         old_mem: []u8,
-        old_alignment: u29,
+        old_align: u29,
         new_size: usize,
         new_align: u29,
     ) error{OutOfMemory}![]u8 {
@@ -167,7 +167,7 @@ const SimpleAllocator = struct {
     fn shrink(
         allocator: *Allocator,
         old_mem: []u8,
-        old_alignment: u29,
+        old_align: u29,
         new_size: usize,
         new_align: u29,
     ) []u8 {

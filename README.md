@@ -101,28 +101,39 @@ Allocations use the data to iterate to find a free slot. Frees assert that the
 corresponding bit is 1 and set it to 0.
 
 The memory for the allocator goes on its own page, with no write permissions.
-On call to alloc and free, the allocator uses mprotect to make its own state
+On call to reallocFn and shrinkFn, the allocator uses mprotect to make its own state
 writable, and then removes write permissions before returning. However bucket
 metadata is not protected in this way yet.
 
 Buckets have prev and next pointers. When there is only one bucket for a given
 size class, both prev and next point to itself. When all slots of a bucket are
 used, a new bucket is allocated, and enters the doubly linked list. The main
-allocator state tracks the "current" bucket for each size class.
+allocator state tracks the "current" bucket for each size class. Leak detection
+currently only checks the current bucket.
+
+Reallocation detects if the size class is unchanged, in which case the same
+pointer is returned unmodified. If a different size class is required, the
+allocator attempts to allocate a new slot, copy the bytes, and then free the
+old slot.
 
 ## Roadmap
 
+* Implement shrink
+* Reallocation of small object to large object
+* Reallocation of large object to large object
+* Reallocation of large object to small object
 * Handle the case when realloc sized down and free would find another bucket.
 * Scan all buckets when detecting leaks.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
 * On invalid free, print nearest allocation/deallocation stack trace
 * Do the memory protection for bucket metadata too
-* Catch the error when wrong n or wrong alignment is given to free or realloc/shrink.
+* Catch the error when wrong size or wrong alignment is given to free or realloc/shrink.
 * Ability to print stats
   * Requested Bytes Allocated (total of n for every alloc minus n for every free)
   * Resident Bytes (pagesize * number of pages mmapped for slots)
   * Overhead Bytes (how much memory the allocator state is using)
+* Make it configurable with comptime parameters
 * Validation fuzz testing
 * Performance benchmarking
   * Do we need meta-buckets?
@@ -134,3 +145,5 @@ allocator state tracks the "current" bucket for each size class.
 * Write unit tests / regression tests
 * Ability to specify maximum memory usage before returning OutOfMemory
 * Port to freestanding / support backing allocator rather than OS API
+* Make `std.HashMap` return bytes back to the allocator when the hash map gets
+  smaller.
