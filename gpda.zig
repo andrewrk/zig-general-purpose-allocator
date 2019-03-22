@@ -523,7 +523,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         if (size_class == new_size_class) {
             return old_mem.ptr[0..new_size];
         }
-        if (new_size_class > largest_bucket_object_size) {
+        if (new_aligned_size > largest_bucket_object_size) {
             @panic("realloc moving from buckets to non buckets");
         }
         const ptr = try self.allocSlot(new_size_class, @returnAddress());
