@@ -56,8 +56,9 @@ ReleaseSafe Mode:
 
 ## Current Status
 
- * POSIX-only
- * Only supports allocations less than one page of memory
+ * POSIX-only so far.
+ * Most basic functionality works. See Roadmap below for what's left to do.
+ * Not well tested yet.
 
 Memory leak detection:
 
