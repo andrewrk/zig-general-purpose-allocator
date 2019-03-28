@@ -119,7 +119,6 @@ old slot.
 
 ## Roadmap
 
-* Reallocation of large object to large object, growing when it has to mmap
 * Reallocation of small object to large object
 * Reallocation/shrink of large object to large object, shrinking
 * Reallocation/shrink of large object to small object
@@ -153,3 +152,5 @@ old slot.
 * Detect when client uses the wrong `old_align` or `old_mem.len`.
 * Keep track of first allocation stack trace as well as reallocation stack trace
   for large objects.
+* Test whether it is an improvement to try to use an mmap hint when growing
+  a large object and it has to mmap more.

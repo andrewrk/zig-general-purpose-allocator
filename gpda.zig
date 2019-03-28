@@ -467,21 +467,26 @@ pub const GeneralPurposeDebugAllocator = struct {
                 self.directFree(old_mem);
                 return old_mem[0..0];
             } else if (new_size > old_mem.len or new_align > old_align) {
-                if (new_align > old_align) {
-                    @panic("TODO handle re-alignment");
-                }
+                self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+                defer self.simple_allocator.mprotect(posix.PROT_READ);
+
                 const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
                 const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
                 if (new_size <= end_page) {
-                    self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-                    defer self.simple_allocator.mprotect(posix.PROT_READ);
+                    if (new_align > old_align) {
+                        // TODO test if the pointer happens to be already aligned to new_align
+                        @panic("TODO handle re-alignment");
+                    }
 
                     const result = old_mem.ptr[0..new_size];
                     old_kv.value.bytes = result;
                     collectStackTrace(return_addr, &old_kv.value.stack_addresses);
                     return result;
                 }
-                @panic("TODO mmap more pages");
+                const new_mem = try self.directAlloc(new_size, new_align, return_addr);
+                @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
+                self.directFree(old_mem);
+                return new_mem;
             } else {
                 @panic("handle realloc/shrink of large object");
             }
@@ -742,4 +747,6 @@ test "large object - grow" {
 
     slice1 = try allocator.realloc(slice1, page_size * 2);
     assert(slice1.ptr == old.ptr);
+
+    slice1 = try allocator.realloc(slice1, page_size * 2 + 1);
 }
