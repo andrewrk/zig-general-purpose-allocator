@@ -119,12 +119,11 @@ old slot.
 
 ## Roadmap
 
-* Implement shrink
-  - large object to small object
-  - large object to large object
+* Reallocation of large object to large object, growing when it has to mmap
 * Reallocation of small object to large object
-* Reallocation of large object to large object
-* Reallocation of large object to small object
+* Reallocation/shrink of large object to large object, shrinking
+* Reallocation/shrink of large object to small object
+* Handle re-alignment of large objects with same or smaller size
 * Handle the case when realloc sized down and free would find another bucket.
 * Scan all buckets when detecting leaks.
 * Make allocations favor iterating forward over slots. Favor using new slots in
@@ -151,3 +150,6 @@ old slot.
 * Make `std.HashMap` return bytes back to the allocator when the hash map gets
   smaller.
 * Make deallocated but still mapped bytes be `0xdd`.
+* Detect when client uses the wrong `old_align` or `old_mem.len`.
+* Keep track of first allocation stack trace as well as reallocation stack trace
+  for large objects.

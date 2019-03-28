@@ -19,91 +19,10 @@ const stack_n = 4;
 const one_trace_size = @sizeOf(usize) * stack_n;
 const traces_per_slot = 2;
 
-// Bucket: In memory, in order:
-// * BucketHeader
-// * bucket_used_bits: [N]u8, // 1 bit for every slot; 1 byte for every 8 slots
-// * stack_trace_addresses: [N]usize, // traces_per_slot for every allocation
-
-const BucketHeader = struct {
-    prev: *BucketHeader,
-    next: *BucketHeader,
-    page: [*]align(page_size) u8,
-    used_bits_index: usize,
-    used_count: usize,
-
-    fn usedBits(bucket: *BucketHeader, index: usize) *u8 {
-        return @intToPtr(*u8, @ptrToInt(bucket) + @sizeOf(BucketHeader) + index);
-    }
-
-    fn stackTracePtr(
-        bucket: *BucketHeader,
-        size_class: usize,
-        slot_index: usize,
-        trace_kind: TraceKind,
-    ) *[stack_n]usize {
-        const start_ptr = @ptrCast([*]u8, bucket) + bucketStackFramesStart(size_class);
-        const addr = start_ptr + one_trace_size * traces_per_slot * slot_index +
-            @enumToInt(trace_kind) * usize(one_trace_size);
-        return @ptrCast(*[stack_n]usize, addr);
-    }
-
-    fn captureStackTrace(
-        bucket: *BucketHeader,
-        return_address: usize,
-        size_class: usize,
-        slot_index: usize,
-        trace_kind: TraceKind,
-    ) void {
-        // Initialize them to 0. When determining the count we must look
-        // for non zero addresses.
-        const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
-        std.mem.set(usize, stack_addresses, 0);
-        var stack_trace = builtin.StackTrace{
-            .instruction_addresses = stack_addresses,
-            .index = 0,
-        };
-        std.debug.captureStackTrace(return_address, &stack_trace);
-    }
-};
-
 const TraceKind = enum {
     Alloc,
     Free,
 };
-
-fn bucketStackTrace(
-    bucket: *BucketHeader,
-    size_class: usize,
-    slot_index: usize,
-    trace_kind: TraceKind,
-) builtin.StackTrace {
-    const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
-    var len: usize = 0;
-    while (len < stack_n and stack_addresses[len] != 0) {
-        len += 1;
-    }
-    return builtin.StackTrace{
-        .instruction_addresses = stack_addresses,
-        .index = len,
-    };
-}
-
-fn bucketStackFramesStart(size_class: usize) usize {
-    return std.mem.alignForward(
-        @sizeOf(BucketHeader) + usedBitsCount(size_class),
-        @alignOf(usize),
-    );
-}
-
-fn bucketSize(size_class: usize) usize {
-    const slot_count = @divExact(page_size, size_class);
-    return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot * slot_count;
-}
-
-fn usedBitsCount(size_class: usize) usize {
-    const slot_count = @divExact(page_size, size_class);
-    return @divExact(slot_count, 8);
-}
 
 fn hash_addr(addr: usize) u32 {
     // TODO ignore the least significant bits because addr is guaranteed
@@ -232,6 +151,82 @@ pub const GeneralPurposeDebugAllocator = struct {
         return self;
     }
 
+    // Bucket: In memory, in order:
+    // * BucketHeader
+    // * bucket_used_bits: [N]u8, // 1 bit for every slot; 1 byte for every 8 slots
+    // * stack_trace_addresses: [N]usize, // traces_per_slot for every allocation
+
+    const BucketHeader = struct {
+        prev: *BucketHeader,
+        next: *BucketHeader,
+        page: [*]align(page_size) u8,
+        used_bits_index: usize,
+        used_count: usize,
+
+        fn usedBits(bucket: *BucketHeader, index: usize) *u8 {
+            return @intToPtr(*u8, @ptrToInt(bucket) + @sizeOf(BucketHeader) + index);
+        }
+
+        fn stackTracePtr(
+            bucket: *BucketHeader,
+            size_class: usize,
+            slot_index: usize,
+            trace_kind: TraceKind,
+        ) *[stack_n]usize {
+            const start_ptr = @ptrCast([*]u8, bucket) + bucketStackFramesStart(size_class);
+            const addr = start_ptr + one_trace_size * traces_per_slot * slot_index +
+                @enumToInt(trace_kind) * usize(one_trace_size);
+            return @ptrCast(*[stack_n]usize, addr);
+        }
+
+        fn captureStackTrace(
+            bucket: *BucketHeader,
+            return_address: usize,
+            size_class: usize,
+            slot_index: usize,
+            trace_kind: TraceKind,
+        ) void {
+            // Initialize them to 0. When determining the count we must look
+            // for non zero addresses.
+            const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
+            collectStackTrace(return_address, stack_addresses);
+        }
+    };
+
+    fn bucketStackTrace(
+        bucket: *BucketHeader,
+        size_class: usize,
+        slot_index: usize,
+        trace_kind: TraceKind,
+    ) builtin.StackTrace {
+        const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
+        var len: usize = 0;
+        while (len < stack_n and stack_addresses[len] != 0) {
+            len += 1;
+        }
+        return builtin.StackTrace{
+            .instruction_addresses = stack_addresses,
+            .index = len,
+        };
+    }
+
+    fn bucketStackFramesStart(size_class: usize) usize {
+        return std.mem.alignForward(
+            @sizeOf(BucketHeader) + usedBitsCount(size_class),
+            @alignOf(usize),
+        );
+    }
+
+    fn bucketSize(size_class: usize) usize {
+        const slot_count = @divExact(page_size, size_class);
+        return bucketStackFramesStart(size_class) + one_trace_size * traces_per_slot * slot_count;
+    }
+
+    fn usedBitsCount(size_class: usize) usize {
+        const slot_count = @divExact(page_size, size_class);
+        return @divExact(slot_count, 8);
+    }
+
     fn mprotectInit(self: *GeneralPurposeDebugAllocator, protection: u32) !void {
         os.posixMProtect(@ptrToInt(self), page_size, protection) catch |e| switch (e) {
             error.AccessDenied => unreachable,
@@ -330,9 +325,13 @@ pub const GeneralPurposeDebugAllocator = struct {
             @panic("OS provided unexpected memory address");
         }
         gop.kv.value.bytes = bytes;
-        std.mem.set(usize, &gop.kv.value.stack_addresses, 0);
+        collectStackTrace(first_trace_addr, &gop.kv.value.stack_addresses);
+    }
+
+    fn collectStackTrace(first_trace_addr: usize, addresses: *[stack_n]usize) void {
+        std.mem.set(usize, addresses, 0);
         var stack_trace = builtin.StackTrace{
-            .instruction_addresses = &gop.kv.value.stack_addresses,
+            .instruction_addresses = addresses,
             .index = 0,
         };
         std.debug.captureStackTrace(first_trace_addr, &stack_trace);
@@ -467,6 +466,22 @@ pub const GeneralPurposeDebugAllocator = struct {
             if (new_size == 0) {
                 self.directFree(old_mem);
                 return old_mem[0..0];
+            } else if (new_size > old_mem.len or new_align > old_align) {
+                if (new_align > old_align) {
+                    @panic("TODO handle re-alignment");
+                }
+                const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
+                const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
+                if (new_size <= end_page) {
+                    self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+                    defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+                    const result = old_mem.ptr[0..new_size];
+                    old_kv.value.bytes = result;
+                    collectStackTrace(return_addr, &old_kv.value.stack_addresses);
+                    return result;
+                }
+                @panic("TODO mmap more pages");
             } else {
                 @panic("handle realloc/shrink of large object");
             }
@@ -711,4 +726,20 @@ test "shrink" {
     for (slice) |b| {
         assert(b == 0x11);
     }
+}
+
+test "large object - grow" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice1 = try allocator.alloc(u8, page_size * 2 - 20);
+    defer allocator.free(slice1);
+
+    var old = slice1;
+    slice1 = try allocator.realloc(slice1, page_size * 2 - 10);
+    assert(slice1.ptr == old.ptr);
+
+    slice1 = try allocator.realloc(slice1, page_size * 2);
+    assert(slice1.ptr == old.ptr);
 }
