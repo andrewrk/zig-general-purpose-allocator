@@ -384,16 +384,6 @@ pub const GeneralPurposeDebugAllocator = struct {
         return bucket.page + slot_index * size_class;
     }
 
-    fn reallocLarge(
-        self: *GeneralPurposeDebugAllocator,
-        old_mem: []u8,
-        old_align: u29,
-        new_size: usize,
-        alignment: u29,
-    ) Error![]u8 {
-        @panic("TODO handle realloc of large object");
-    }
-
     fn searchBucket(
         self: *GeneralPurposeDebugAllocator,
         bucket_index: usize,
@@ -444,31 +434,42 @@ pub const GeneralPurposeDebugAllocator = struct {
         }
     }
 
-    fn realloc(
+    fn reallocOrShrink(
         allocator: *Allocator,
         old_mem: []u8,
         old_align: u29,
         new_size: usize,
         new_align: u29,
+        return_addr: usize,
+        behavior: enum {
+        shrink,
+        realloc,
+    },
     ) Error![]u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
         defer self.mprotect(posix.PROT_READ);
 
         if (old_mem.len == 0) {
+            assert(behavior == .realloc);
             const new_aligned_size = std.math.max(new_size, new_align);
             if (new_aligned_size > largest_bucket_object_size) {
-                return self.directAlloc(new_size, new_align, @returnAddress());
+                return self.directAlloc(new_size, new_align, return_addr);
             } else {
                 const new_size_class = up_to_nearest_power_of_2(usize, new_aligned_size);
-                const ptr = try self.allocSlot(new_size_class, @returnAddress());
+                const ptr = try self.allocSlot(new_size_class, return_addr);
                 return ptr[0..new_size];
             }
         }
 
         const aligned_size = std.math.max(old_mem.len, old_align);
         if (aligned_size > largest_bucket_object_size) {
-            return self.reallocLarge(old_mem, old_align, new_size, new_align);
+            if (new_size == 0) {
+                self.directFree(old_mem);
+                return old_mem[0..0];
+            } else {
+                @panic("handle realloc/shrink of large object");
+            }
         }
         const size_class = up_to_nearest_power_of_2(usize, aligned_size);
 
@@ -478,7 +479,7 @@ pub const GeneralPurposeDebugAllocator = struct {
                 break bucket;
             }
         } else {
-            return self.reallocLarge(old_mem, old_align, new_size, new_align);
+            @panic("handle realloc/shrink of large object");
         };
         const byte_offset = @ptrToInt(old_mem.ptr) - @ptrToInt(bucket.page);
         const slot_index = byte_offset / size_class;
@@ -504,7 +505,7 @@ pub const GeneralPurposeDebugAllocator = struct {
                 slot_index,
                 used_byte,
                 used_bit_index,
-                @returnAddress(),
+                return_addr,
             );
             return old_mem[0..0];
         }
@@ -514,9 +515,15 @@ pub const GeneralPurposeDebugAllocator = struct {
             return old_mem.ptr[0..new_size];
         }
         if (new_aligned_size > largest_bucket_object_size) {
-            @panic("realloc moving from buckets to non buckets");
+            @panic("realloc/shrink moving from buckets to non buckets");
         }
-        const ptr = try self.allocSlot(new_size_class, @returnAddress());
+        // Migrating to a smaller size class.
+        const ptr = self.allocSlot(new_size_class, return_addr) catch |e| switch (e) {
+            error.OutOfMemory => switch (behavior) {
+                .realloc => return error.OutOfMemory,
+                .shrink => return old_mem.ptr[0..new_size],
+            },
+        };
         @memcpy(ptr, old_mem.ptr, old_mem.len);
         self.freeSlot(
             bucket,
@@ -525,7 +532,7 @@ pub const GeneralPurposeDebugAllocator = struct {
             slot_index,
             used_byte,
             used_bit_index,
-            @returnAddress(),
+            return_addr,
         );
         return ptr[0..new_size];
     }
@@ -559,48 +566,33 @@ pub const GeneralPurposeDebugAllocator = struct {
         new_size: usize,
         new_align: u29,
     ) []u8 {
-        const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
-        self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-        defer self.mprotect(posix.PROT_READ);
-        if (new_size > 0) {
-            @panic("TODO handle shrink to nonzero");
-        }
-        const aligned_size = std.math.max(old_mem.len, old_align);
-        if (aligned_size > largest_bucket_object_size) {
-            self.directFree(old_mem);
-            return old_mem[0..0];
-        }
-        const size_class = up_to_nearest_power_of_2(usize, aligned_size);
-        const bucket_index = std.math.log2(size_class);
-        const bucket = self.searchBucket(bucket_index, @ptrToInt(old_mem.ptr)) orelse {
-            @panic("Invalid free");
-        };
-        const byte_offset = @ptrToInt(old_mem.ptr) - @ptrToInt(bucket.page);
-        const slot_index = byte_offset / size_class;
-        const used_byte_index = slot_index / 8;
-        const used_bit_index = @intCast(u3, slot_index % 8);
-        const used_byte = bucket.usedBits(used_byte_index);
-        const is_used = @truncate(u1, used_byte.* >> used_bit_index) != 0;
-        if (!is_used) {
-            // print allocation stack trace
-            std.debug.warn("\nDouble free detected, allocated here:\n");
-            const alloc_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Alloc);
-            std.debug.dumpStackTrace(alloc_stack_trace);
-            std.debug.warn("\nFirst free here:\n");
-            const free_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Free);
-            std.debug.dumpStackTrace(free_stack_trace);
-            @panic("\nSecond free here:");
-        }
-        self.freeSlot(
-            bucket,
-            bucket_index,
-            size_class,
-            slot_index,
-            used_byte,
-            used_bit_index,
+        return reallocOrShrink(
+            allocator,
+            old_mem,
+            old_align,
+            new_size,
+            new_align,
             @returnAddress(),
+            .shrink,
+        ) catch unreachable;
+    }
+
+    fn realloc(
+        allocator: *Allocator,
+        old_mem: []u8,
+        old_align: u29,
+        new_size: usize,
+        new_align: u29,
+    ) Error![]u8 {
+        return reallocOrShrink(
+            allocator,
+            old_mem,
+            old_align,
+            new_size,
+            new_align,
+            @returnAddress(),
+            .realloc,
         );
-        return old_mem[0..0];
     }
 
     fn createBucket(
@@ -696,4 +688,27 @@ test "realloc" {
     slice = try allocator.realloc(slice, 17);
     assert(slice[0] == 0x12);
     assert(slice[1] == 0x34);
+}
+
+test "shrink" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice = try allocator.alloc(u8, 20);
+    defer allocator.free(slice);
+
+    std.mem.set(u8, slice, 0x11);
+
+    slice = allocator.shrink(slice, 17);
+
+    for (slice) |b| {
+        assert(b == 0x11);
+    }
+
+    slice = allocator.shrink(slice, 16);
+
+    for (slice) |b| {
+        assert(b == 0x11);
+    }
 }

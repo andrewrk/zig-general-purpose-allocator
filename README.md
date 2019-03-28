@@ -120,6 +120,8 @@ old slot.
 ## Roadmap
 
 * Implement shrink
+  - large object to small object
+  - large object to large object
 * Reallocation of small object to large object
 * Reallocation of large object to large object
 * Reallocation of large object to small object
@@ -148,3 +150,4 @@ old slot.
 * Port to freestanding / support backing allocator rather than OS API
 * Make `std.HashMap` return bytes back to the allocator when the hash map gets
   smaller.
+* Make deallocated but still mapped bytes be `0xdd`.
