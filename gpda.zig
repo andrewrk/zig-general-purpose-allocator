@@ -535,7 +535,21 @@ pub const GeneralPurposeDebugAllocator = struct {
             return old_mem.ptr[0..new_size];
         }
         if (new_aligned_size > largest_bucket_object_size) {
-            @panic("realloc/shrink moving from buckets to non buckets");
+            self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+            defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+            const new_mem = try self.directAlloc(new_size, new_align, return_addr);
+            @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
+            self.freeSlot(
+                bucket,
+                bucket_index,
+                size_class,
+                slot_index,
+                used_byte,
+                used_bit_index,
+                return_addr,
+            );
+            return new_mem;
         }
         // Migrating to a smaller size class.
         const ptr = self.allocSlot(new_size_class, return_addr) catch |e| switch (e) {
@@ -749,4 +763,21 @@ test "large object - grow" {
     assert(slice1.ptr == old.ptr);
 
     slice1 = try allocator.realloc(slice1, page_size * 2 + 1);
+}
+
+test "realloc small object to large object" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice = try allocator.alloc(u8, 70);
+    defer allocator.free(slice);
+    slice[0] = 0x12;
+    slice[60] = 0x34;
+
+    // This requires upgrading to a large object
+    const large_object_size = page_size * 2 + 50;
+    slice = try allocator.realloc(slice, large_object_size);
+    assert(slice[0] == 0x12);
+    assert(slice[60] == 0x34);
 }
