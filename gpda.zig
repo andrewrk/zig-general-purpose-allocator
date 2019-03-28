@@ -263,7 +263,7 @@ pub const GeneralPurposeDebugAllocator = struct {
                                 bucket,
                                 size_class,
                                 slot_index,
-                                TraceKind.Alloc,
+                                .Alloc,
                             );
                             std.debug.dumpStackTrace(stack_trace);
                         }
@@ -379,7 +379,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         used_bits_byte.* |= (u8(1) << used_bit_index);
 
         const slot_index = bucket.used_bits_index * 8 + used_bit_index;
-        bucket.captureStackTrace(trace_addr, size_class, slot_index, TraceKind.Alloc);
+        bucket.captureStackTrace(trace_addr, size_class, slot_index, .Alloc);
 
         return bucket.page + slot_index * size_class;
     }
@@ -424,7 +424,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         trace_addr: usize,
     ) void {
         // Capture stack trace to be the "first free", in case a double free happens.
-        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, TraceKind.Free);
+        bucket.captureStackTrace(@returnAddress(), size_class, slot_index, .Free);
 
         used_byte.* &= ~(u8(1) << used_bit_index);
         bucket.used_count -= 1;
@@ -489,20 +489,10 @@ pub const GeneralPurposeDebugAllocator = struct {
         if (!is_used) {
             // print allocation stack trace
             std.debug.warn("\nDouble free detected, allocated here:\n");
-            const alloc_stack_trace = bucketStackTrace(
-                bucket,
-                size_class,
-                slot_index,
-                TraceKind.Alloc,
-            );
+            const alloc_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Alloc);
             std.debug.dumpStackTrace(alloc_stack_trace);
             std.debug.warn("\nFirst free here:\n");
-            const free_stack_trace = bucketStackTrace(
-                bucket,
-                size_class,
-                slot_index,
-                TraceKind.Free,
-            );
+            const free_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Free);
             std.debug.dumpStackTrace(free_stack_trace);
             @panic("\nSecond free here:");
         }
@@ -594,20 +584,10 @@ pub const GeneralPurposeDebugAllocator = struct {
         if (!is_used) {
             // print allocation stack trace
             std.debug.warn("\nDouble free detected, allocated here:\n");
-            const alloc_stack_trace = bucketStackTrace(
-                bucket,
-                size_class,
-                slot_index,
-                TraceKind.Alloc,
-            );
+            const alloc_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Alloc);
             std.debug.dumpStackTrace(alloc_stack_trace);
             std.debug.warn("\nFirst free here:\n");
-            const free_stack_trace = bucketStackTrace(
-                bucket,
-                size_class,
-                slot_index,
-                TraceKind.Free,
-            );
+            const free_stack_trace = bucketStackTrace(bucket, size_class, slot_index, .Free);
             std.debug.dumpStackTrace(free_stack_trace);
             @panic("\nSecond free here:");
         }
