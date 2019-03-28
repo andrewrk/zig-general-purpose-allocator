@@ -479,6 +479,7 @@ pub const GeneralPurposeDebugAllocator = struct {
                     }
 
                     const result = old_mem.ptr[0..new_size];
+                    // TODO test if the old_mem.len is correct
                     old_kv.value.bytes = result;
                     collectStackTrace(return_addr, &old_kv.value.stack_addresses);
                     return result;
@@ -488,7 +489,27 @@ pub const GeneralPurposeDebugAllocator = struct {
                 self.directFree(old_mem);
                 return new_mem;
             } else {
-                @panic("handle realloc/shrink of large object");
+                const new_aligned_size = std.math.max(new_size, new_align);
+                if (new_aligned_size > largest_bucket_object_size) {
+                    self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+                    defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+                    const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
+                    const result = old_mem.ptr[0..new_size];
+                    // TODO test if the old_mem.len is correct
+                    old_kv.value.bytes = result;
+                    collectStackTrace(return_addr, &old_kv.value.stack_addresses);
+                    const old_end_page = std.mem.alignForward(old_mem.len, page_size);
+                    const new_end_page = std.mem.alignForward(new_size, page_size);
+                    if (new_end_page < old_end_page) {
+                        sysFree(old_mem.ptr[new_end_page..old_end_page]);
+                    } else if (behavior == .realloc) {
+                        return error.OutOfMemory;
+                    }
+                    return result;
+                } else {
+                    @panic("handle realloc/shrink of large object to small object");
+                }
             }
         }
         const size_class = up_to_nearest_power_of_2(usize, aligned_size);
@@ -778,6 +799,29 @@ test "realloc small object to large object" {
     // This requires upgrading to a large object
     const large_object_size = page_size * 2 + 50;
     slice = try allocator.realloc(slice, large_object_size);
+    assert(slice[0] == 0x12);
+    assert(slice[60] == 0x34);
+}
+
+test "shrink large object to large object" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice = try allocator.alloc(u8, page_size * 2 + 50);
+    defer allocator.free(slice);
+    slice[0] = 0x12;
+    slice[60] = 0x34;
+
+    if (allocator.realloc(slice, page_size * 2 + 1)) |_| {
+        @panic("expected failure");
+    } else |e| assert(e == error.OutOfMemory);
+
+    slice = allocator.shrink(slice, page_size * 2 + 1);
+    assert(slice[0] == 0x12);
+    assert(slice[60] == 0x34);
+
+    slice = try allocator.realloc(slice, page_size * 2);
     assert(slice[0] == 0x12);
     assert(slice[60] == 0x34);
 }
