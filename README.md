@@ -117,6 +117,10 @@ pointer is returned unmodified. If a different size class is required, the
 allocator attempts to allocate a new slot, copy the bytes, and then free the
 old slot.
 
+Large objects are allocated directly using `mmap` and their metadata is stored
+in a `std.HashMap` backed by a simple direct allocator. The hash map's data
+is memory protected with the same strategy as the allocator's state.
+
 ## Roadmap
 
 * Reallocation/shrink of large object to small object
