@@ -145,7 +145,6 @@ is memory protected with the same strategy as the allocator's state.
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
 * Ability to specify maximum memory usage before returning OutOfMemory
-* Port to freestanding / support backing allocator rather than OS API
 * Make `std.HashMap` return bytes back to the allocator when the hash map gets
   smaller.
 * Make deallocated but still mapped bytes be `0xdd`.

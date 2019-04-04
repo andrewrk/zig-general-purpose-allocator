@@ -10,16 +10,39 @@ pub const Config = struct {
     /// Number of stack frames to capture. Default: 4
     /// TODO https://github.com/ziglang/zig/issues/485
     stack_trace_frames: usize,
+
+    /// Whether the allocator is configured to accept a backing
+    /// allocator used for the underlying memory. Default is
+    /// false, which means it will make syscalls directly, and
+    /// the create() function takes no arguments.
+    /// If this is set to true, create() takes a *Allocator parameter.
+    backing_allocator: bool,
+
+    /// Whether to use mprotect to take away write permission
+    /// from allocator internal state to prevent allocator state
+    /// corruption. Enabling this catches bugs but is slower.
+    /// Default: true
+    memory_protection: bool,
 };
 
 pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
     return struct {
         allocator: Allocator,
+        backing_allocator: BackingAllocator,
         buckets: [small_bucket_count]?*BucketHeader,
-        simple_allocator: SimpleAllocator,
+        simple_allocator: SimpleAllocatorType,
         large_allocations: LargeAllocTable,
 
+        comptime {
+            if (config.backing_allocator and config.memory_protection) {
+                @compileError("Memory protection is unavailable when using a backing allocator");
+            }
+        }
+
         const Self = @This();
+
+        const BackingAllocator = if (config.backing_allocator) *Allocator else void;
+        const SimpleAllocatorType = if (config.backing_allocator) void else SimpleAllocator;
 
         const stack_n = config.stack_trace_frames;
         const one_trace_size = @sizeOf(usize) * stack_n;
@@ -48,20 +71,37 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         };
         const LargeAllocTable = std.HashMap(usize, LargeAlloc, hash_addr, eql_addr);
 
-        pub fn create() !*Self {
-            const self_bytes = try sysAlloc(@sizeOf(Self));
-            const self = @ptrCast(*Self, self_bytes.ptr);
+        pub fn createWithAllocator(backing_allocator: BackingAllocator) !*Self {
+            const self = blk: {
+                if (config.backing_allocator) {
+                    break :blk try backing_allocator.create(Self);
+                } else {
+                    const self_bytes = try sysAlloc(undefined, @sizeOf(Self));
+                    break :blk @ptrCast(*Self, self_bytes.ptr);
+                }
+            };
             self.* = Self{
                 .allocator = Allocator{
                     .reallocFn = realloc,
                     .shrinkFn = shrink,
                 },
+                .backing_allocator = backing_allocator,
                 .buckets = [1]?*BucketHeader{null} ** small_bucket_count,
-                .simple_allocator = SimpleAllocator.init(),
-                .large_allocations = LargeAllocTable.init(&self.simple_allocator.allocator),
+                .simple_allocator = if (config.backing_allocator) {} else SimpleAllocator.init(),
+                .large_allocations = LargeAllocTable.init(if (config.backing_allocator)
+                        backing_allocator
+                    else
+                        &self.simple_allocator.allocator),
             };
             try self.mprotectInit(posix.PROT_READ);
             return self;
+        }
+
+        pub fn create() !*Self {
+            if (config.backing_allocator) {
+                @compileError("GeneralPurposeDebugAllocator has backing_allocator enabled therefore client must call createWithAllocator()");
+            }
+            return createWithAllocator({});
         }
 
         // Bucket: In memory, in order:
@@ -140,7 +180,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return @divExact(slot_count, 8);
         }
 
-        fn mprotectInit(self: *Self, protection: u32) !void {
+        fn mprotectInit(self: *Self, protection: u32) Error!void {
+            if (!config.memory_protection) return;
             os.posixMProtect(@ptrToInt(self), page_size, protection) catch |e| switch (e) {
                 error.AccessDenied => unreachable,
                 error.OutOfMemory => return error.OutOfMemory,
@@ -149,6 +190,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         }
 
         fn mprotect(self: *Self, protection: u32) void {
+            if (!config.memory_protection) return;
             os.posixMProtect(@ptrToInt(self), page_size, protection) catch unreachable;
         }
 
@@ -186,8 +228,9 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 std.debug.warn("\nMemory leak detected:\n");
                 large_alloc.value.dumpStackTrace();
             }
-            self.simple_allocator.deinit(); // Free large_allocations memory.
-            sysFree(@ptrCast([*]u8, self)[0..@sizeOf(Self)]);
+            if (!config.backing_allocator)
+                self.simple_allocator.deinit(); // Free large_allocations memory.
+            self.sysFree(@ptrCast([*]u8, self)[0..@sizeOf(Self)]);
         }
 
         fn directAlloc(
@@ -198,8 +241,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         ) Error![]u8 {
             const p = posix;
             const alloc_size = if (alignment <= os.page_size) n else n + alignment;
-            const slice = try sysAlloc(alloc_size);
-            errdefer sysFree(slice);
+            const slice = try self.sysAlloc(alloc_size);
+            errdefer self.sysFree(slice);
 
             if (alloc_size == n) {
                 try self.trackLargeAlloc(slice, first_trace_addr);
@@ -216,7 +259,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             // Since alignment > page_size, we are by definition on a page boundary.
             const unused_len = aligned_addr - 1 - addr;
 
-            sysFree(slice[0..unused_len]);
+            self.sysFree(slice[0..unused_len]);
 
             // It is impossible that there is an unoccupied page at the top of our
             // mmap.
@@ -225,13 +268,19 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return result;
         }
 
+        fn mprotectLargeAllocs(self: *Self, flags: u32) void {
+            if (!config.memory_protection) return;
+            if (config.backing_allocator) return;
+            self.simple_allocator.mprotect(flags);
+        }
+
         fn trackLargeAlloc(
             self: *Self,
             bytes: []u8,
             first_trace_addr: usize,
         ) !void {
-            self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.simple_allocator.mprotect(posix.PROT_READ);
+            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+            defer self.mprotectLargeAllocs(posix.PROT_READ);
 
             const gop = try self.large_allocations.getOrPut(@ptrToInt(bytes.ptr));
             if (gop.found_existing) {
@@ -339,10 +388,10 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                     bucket.prev.next = bucket.next;
                     self.buckets[bucket_index] = bucket.prev;
                 }
-                sysFree(bucket.page[0..page_size]);
+                self.sysFree(bucket.page[0..page_size]);
                 const bucket_size = bucketSize(size_class);
                 const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-                sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
+                self.sysFree(@ptrCast([*]u8, bucket)[0..aligned_bucket_size]);
             }
         }
 
@@ -358,8 +407,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return_addr: usize,
             behavior: ResizeBehavior,
         ) Error![]u8 {
-            self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.simple_allocator.mprotect(posix.PROT_READ);
+            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+            defer self.mprotectLargeAllocs(posix.PROT_READ);
 
             const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
             const result = old_mem.ptr[0..new_size];
@@ -369,7 +418,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             const old_end_page = std.mem.alignForward(old_mem.len, page_size);
             const new_end_page = std.mem.alignForward(new_size, page_size);
             if (new_end_page < old_end_page) {
-                sysFree(old_mem.ptr[new_end_page..old_end_page]);
+                self.sysFree(old_mem.ptr[new_end_page..old_end_page]);
             } else if (behavior == .realloc) {
                 return error.OutOfMemory;
             }
@@ -407,8 +456,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                     self.directFree(old_mem);
                     return old_mem[0..0];
                 } else if (new_size > old_mem.len or new_align > old_align) {
-                    self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-                    defer self.simple_allocator.mprotect(posix.PROT_READ);
+                    self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+                    defer self.mprotectLargeAllocs(posix.PROT_READ);
 
                     const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
                     const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
@@ -492,8 +541,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 return old_mem.ptr[0..new_size];
             }
             if (new_aligned_size > largest_bucket_object_size) {
-                self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-                defer self.simple_allocator.mprotect(posix.PROT_READ);
+                self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+                defer self.mprotectLargeAllocs(posix.PROT_READ);
 
                 const new_mem = try self.directAlloc(new_size, new_align, return_addr);
                 @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
@@ -529,8 +578,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         }
 
         fn directFree(self: *Self, bytes: []u8) void {
-            self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.simple_allocator.mprotect(posix.PROT_READ);
+            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+            defer self.mprotectLargeAllocs(posix.PROT_READ);
 
             const kv = self.large_allocations.get(@ptrToInt(bytes.ptr)).?;
             if (bytes.len != kv.value.bytes.len) {
@@ -547,7 +596,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             // TODO we should be able to replace the above call to get() with remove()
             // is it a hash table bug?
             assert(self.large_allocations.remove(@ptrToInt(bytes.ptr)) != null);
-            sysFree(bytes);
+            self.sysFree(bytes);
         }
 
         fn shrink(
@@ -591,12 +640,12 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             size_class: usize,
             bucket_index: usize,
         ) Error!*BucketHeader {
-            const page = try sysAlloc(page_size);
-            errdefer sysFree(page);
+            const page = try self.sysAlloc(page_size);
+            errdefer self.sysFree(page);
 
             const bucket_size = bucketSize(size_class);
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            const bucket_bytes = try sysAlloc(aligned_bucket_size);
+            const bucket_bytes = try self.sysAlloc(aligned_bucket_size);
             const ptr = @ptrCast(*BucketHeader, bucket_bytes.ptr);
             ptr.* = BucketHeader{
                 .prev = ptr,
@@ -606,8 +655,91 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 .used_count = 0,
             };
             self.buckets[bucket_index] = ptr;
+            // Set the used bits to all zeroes
+            @memset((*[1]u8)(ptr.usedBits(0)), 0, usedBitsCount(size_class));
             return ptr;
         }
+
+        fn sysAlloc(self: *Self, len: usize) Error![]align(page_size) u8 {
+            if (config.backing_allocator) {
+                return self.backing_allocator.alignedAlloc(u8, page_size, len);
+            } else {
+                const perms = posix.PROT_READ | posix.PROT_WRITE;
+                const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
+                const addr = posix.mmap(null, len, perms, flags, -1, 0);
+                if (addr == posix.MAP_FAILED) return error.OutOfMemory;
+                return @intToPtr([*]align(page_size) u8, addr)[0..len];
+            }
+        }
+
+        fn sysFree(self: *Self, old_mem: []u8) void {
+            if (config.backing_allocator) {
+                return self.backing_allocator.free(old_mem);
+            } else {
+                assert(posix.getErrno(posix.munmap(@ptrToInt(old_mem.ptr), old_mem.len)) == 0);
+            }
+        }
+
+        const SimpleAllocator = struct {
+            allocator: Allocator,
+            active_allocation: []u8,
+
+            fn init() SimpleAllocator {
+                return SimpleAllocator{
+                    .allocator = Allocator{
+                        .reallocFn = realloc,
+                        .shrinkFn = shrink,
+                    },
+                    .active_allocation = (([*]u8)(undefined))[0..0],
+                };
+            }
+
+            fn deinit(self: SimpleAllocator) void {
+                if (self.active_allocation.len == 0) return;
+                comptime assert(!config.backing_allocator);
+                sysFree(undefined, self.active_allocation);
+            }
+
+            fn realloc(
+                allocator: *Allocator,
+                old_mem: []u8,
+                old_align: u29,
+                new_size: usize,
+                new_align: u29,
+            ) error{OutOfMemory}![]u8 {
+                assert(old_mem.len == 0);
+                assert(new_align < page_size);
+                comptime assert(!config.backing_allocator);
+                const self = @fieldParentPtr(SimpleAllocator, "allocator", allocator);
+                const result = try sysAlloc(undefined, new_size);
+                self.active_allocation = result;
+                return result;
+            }
+
+            fn shrink(
+                allocator: *Allocator,
+                old_mem: []u8,
+                old_align: u29,
+                new_size: usize,
+                new_align: u29,
+            ) []u8 {
+                assert(new_size == 0);
+                comptime assert(!config.backing_allocator);
+                sysFree(undefined, old_mem);
+                return old_mem[0..0];
+            }
+
+            /// Applies to all of the bytes in the entire allocator.
+            pub fn mprotect(self: *SimpleAllocator, protection: u32) void {
+                if (!config.memory_protection) return;
+                if (self.active_allocation.len == 0) return;
+                os.posixMProtect(
+                    @ptrToInt(self.active_allocation.ptr),
+                    std.mem.alignForward(self.active_allocation.len, page_size),
+                    protection,
+                ) catch unreachable;
+            }
+        };
     };
 }
 
@@ -636,77 +768,10 @@ fn eql_addr(a: usize, b: usize) bool {
     return a == b;
 }
 
-fn sysAlloc(len: usize) error{OutOfMemory}![]align(page_size) u8 {
-    const perms = posix.PROT_READ | posix.PROT_WRITE;
-    const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
-    const addr = posix.mmap(null, len, perms, flags, -1, 0);
-    if (addr == posix.MAP_FAILED) return error.OutOfMemory;
-    return @intToPtr([*]align(page_size) u8, addr)[0..len];
-}
-
-fn sysFree(old_mem: []u8) void {
-    assert(posix.getErrno(posix.munmap(@ptrToInt(old_mem.ptr), old_mem.len)) == 0);
-}
-
-const SimpleAllocator = struct {
-    allocator: Allocator,
-    active_allocation: []u8,
-
-    fn init() SimpleAllocator {
-        return SimpleAllocator{
-            .allocator = Allocator{
-                .reallocFn = realloc,
-                .shrinkFn = shrink,
-            },
-            .active_allocation = (([*]u8)(undefined))[0..0],
-        };
-    }
-
-    fn deinit(self: SimpleAllocator) void {
-        if (self.active_allocation.len == 0) return;
-        sysFree(self.active_allocation);
-    }
-
-    fn realloc(
-        allocator: *Allocator,
-        old_mem: []u8,
-        old_align: u29,
-        new_size: usize,
-        new_align: u29,
-    ) error{OutOfMemory}![]u8 {
-        assert(old_mem.len == 0);
-        assert(new_align < page_size);
-        const self = @fieldParentPtr(SimpleAllocator, "allocator", allocator);
-        const result = try sysAlloc(new_size);
-        self.active_allocation = result;
-        return result;
-    }
-
-    fn shrink(
-        allocator: *Allocator,
-        old_mem: []u8,
-        old_align: u29,
-        new_size: usize,
-        new_align: u29,
-    ) []u8 {
-        assert(new_size == 0);
-        sysFree(old_mem);
-        return old_mem[0..0];
-    }
-
-    /// Applies to all of the bytes in the entire allocator.
-    pub fn mprotect(self: *SimpleAllocator, protection: u32) void {
-        if (self.active_allocation.len == 0) return;
-        os.posixMProtect(
-            @ptrToInt(self.active_allocation.ptr),
-            std.mem.alignForward(self.active_allocation.len, page_size),
-            protection,
-        ) catch unreachable;
-    }
-};
-
 const test_config = Config{
     .stack_trace_frames = 4,
+    .backing_allocator = false,
+    .memory_protection = true,
 };
 
 test "small allocations - free in same order" {
@@ -874,4 +939,17 @@ test "realloc large object to small object" {
     slice = try allocator.realloc(slice, 19);
     assert(slice[0] == 0x12);
     assert(slice[16] == 0x34);
+}
+
+test "backing allocator" {
+    const gpda = try GeneralPurposeDebugAllocator(Config{
+        .stack_trace_frames = 4,
+        .backing_allocator = true,
+        .memory_protection = false,
+    }).createWithAllocator(std.debug.global_allocator);
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    const ptr = try allocator.create(i32);
+    defer allocator.destroy(ptr);
 }
