@@ -441,9 +441,9 @@ pub const GeneralPurposeDebugAllocator = struct {
         new_align: u29,
         return_addr: usize,
         behavior: enum {
-        shrink,
-        realloc,
-    },
+            shrink,
+            realloc,
+        },
     ) Error![]u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
