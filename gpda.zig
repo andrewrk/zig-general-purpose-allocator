@@ -433,6 +433,36 @@ pub const GeneralPurposeDebugAllocator = struct {
         }
     }
 
+    const ResizeBehavior = enum {
+        shrink,
+        realloc,
+    };
+
+    fn directRealloc(
+        self: *GeneralPurposeDebugAllocator,
+        old_mem: []u8,
+        new_size: usize,
+        return_addr: usize,
+        behavior: ResizeBehavior,
+    ) Error![]u8 {
+        self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+        defer self.simple_allocator.mprotect(posix.PROT_READ);
+
+        const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
+        const result = old_mem.ptr[0..new_size];
+        // TODO test if the old_mem.len is correct
+        old_kv.value.bytes = result;
+        collectStackTrace(return_addr, &old_kv.value.stack_addresses);
+        const old_end_page = std.mem.alignForward(old_mem.len, page_size);
+        const new_end_page = std.mem.alignForward(new_size, page_size);
+        if (new_end_page < old_end_page) {
+            sysFree(old_mem.ptr[new_end_page..old_end_page]);
+        } else if (behavior == .realloc) {
+            return error.OutOfMemory;
+        }
+        return result;
+    }
+
     fn reallocOrShrink(
         allocator: *Allocator,
         old_mem: []u8,
@@ -440,10 +470,7 @@ pub const GeneralPurposeDebugAllocator = struct {
         new_size: usize,
         new_align: u29,
         return_addr: usize,
-        behavior: enum {
-            shrink,
-            realloc,
-        },
+        behavior: ResizeBehavior,
     ) Error![]u8 {
         const self = @fieldParentPtr(GeneralPurposeDebugAllocator, "allocator", allocator);
         self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
@@ -491,24 +518,20 @@ pub const GeneralPurposeDebugAllocator = struct {
             } else {
                 const new_aligned_size = std.math.max(new_size, new_align);
                 if (new_aligned_size > largest_bucket_object_size) {
-                    self.simple_allocator.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-                    defer self.simple_allocator.mprotect(posix.PROT_READ);
-
-                    const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
-                    const result = old_mem.ptr[0..new_size];
-                    // TODO test if the old_mem.len is correct
-                    old_kv.value.bytes = result;
-                    collectStackTrace(return_addr, &old_kv.value.stack_addresses);
-                    const old_end_page = std.mem.alignForward(old_mem.len, page_size);
-                    const new_end_page = std.mem.alignForward(new_size, page_size);
-                    if (new_end_page < old_end_page) {
-                        sysFree(old_mem.ptr[new_end_page..old_end_page]);
-                    } else if (behavior == .realloc) {
-                        return error.OutOfMemory;
-                    }
-                    return result;
+                    return self.directRealloc(old_mem, new_size, return_addr, behavior);
                 } else {
-                    @panic("handle realloc/shrink of large object to small object");
+                    const new_size_class = up_to_nearest_power_of_2(usize, new_aligned_size);
+                    const ptr = self.allocSlot(new_size_class, return_addr) catch |e| switch (e) {
+                        error.OutOfMemory => return self.directRealloc(
+                            old_mem,
+                            new_size,
+                            return_addr,
+                            behavior,
+                        ),
+                    };
+                    @memcpy(ptr, old_mem.ptr, new_size);
+                    self.directFree(old_mem);
+                    return ptr[0..new_size];
                 }
             }
         }
@@ -579,7 +602,7 @@ pub const GeneralPurposeDebugAllocator = struct {
                 .shrink => return old_mem.ptr[0..new_size],
             },
         };
-        @memcpy(ptr, old_mem.ptr, old_mem.len);
+        @memcpy(ptr, old_mem.ptr, new_size);
         self.freeSlot(
             bucket,
             bucket_index,
@@ -824,4 +847,19 @@ test "shrink large object to large object" {
     slice = try allocator.realloc(slice, page_size * 2);
     assert(slice[0] == 0x12);
     assert(slice[60] == 0x34);
+}
+
+test "realloc large object to small object" {
+    const gpda = try GeneralPurposeDebugAllocator.create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice = try allocator.alloc(u8, page_size * 2 + 50);
+    defer allocator.free(slice);
+    slice[0] = 0x12;
+    slice[16] = 0x34;
+
+    slice = try allocator.realloc(slice, 19);
+    assert(slice[0] == 0x12);
+    assert(slice[16] == 0x34);
 }

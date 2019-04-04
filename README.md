@@ -123,7 +123,6 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
-* Reallocation/shrink of large object to small object
 * Handle re-alignment of large objects with same or smaller size
 * Handle the case when realloc sized down and free would find another bucket.
 * Scan all buckets when detecting leaks.
