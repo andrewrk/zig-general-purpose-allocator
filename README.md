@@ -135,7 +135,6 @@ is memory protected with the same strategy as the allocator's state.
   * Requested Bytes Allocated (total of n for every alloc minus n for every free)
   * Resident Bytes (pagesize * number of pages mmapped for slots)
   * Overhead Bytes (how much memory the allocator state is using)
-* Make it configurable with comptime parameters
 * Validation fuzz testing
 * Performance benchmarking
   * Do we need meta-buckets?

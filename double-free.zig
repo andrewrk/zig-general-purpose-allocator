@@ -1,8 +1,12 @@
 const std = @import("std");
-const GeneralPurposeDebugAllocator = @import("gpda.zig").GeneralPurposeDebugAllocator;
+const gpda_module = @import("gpda.zig");
+
+const test_config = gpda_module.Config{
+    .stack_trace_frames = 4,
+};
 
 test "double free" {
-    const gpda = try GeneralPurposeDebugAllocator.create();
+    const gpda = try gpda_module.GeneralPurposeDebugAllocator(test_config).create();
     defer gpda.destroy();
     const allocator = &gpda.allocator;
 
@@ -17,4 +21,3 @@ test "double free" {
     allocator.destroy(alloc1);
     allocator.destroy(alloc1);
 }
-
