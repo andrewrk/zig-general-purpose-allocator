@@ -3,6 +3,8 @@ const gpda_module = @import("gpda.zig");
 
 const test_config = gpda_module.Config{
     .stack_trace_frames = 4,
+    .backing_allocator = false,
+    .memory_protection = true,
 };
 
 test "invalid free" {
