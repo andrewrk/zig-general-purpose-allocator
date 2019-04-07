@@ -581,7 +581,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
             defer self.mprotectLargeAllocs(posix.PROT_READ);
 
-            const kv = self.large_allocations.get(@ptrToInt(bytes.ptr)).?;
+            var kv = self.large_allocations.remove(@ptrToInt(bytes.ptr)).?;
             if (bytes.len != kv.value.bytes.len) {
                 std.debug.warn(
                     "\nAllocation size {} bytes does not match free size {}. Allocated here:\n",
@@ -593,9 +593,6 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 @panic("\nFree here:");
             }
 
-            // TODO we should be able to replace the above call to get() with remove()
-            // is it a hash table bug?
-            assert(self.large_allocations.remove(@ptrToInt(bytes.ptr)) != null);
             self.sysFree(bytes);
         }
 
