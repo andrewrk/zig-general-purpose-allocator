@@ -123,11 +123,12 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
-* Handle re-alignment of large objects with same or smaller size
 * Handle the case when realloc sized down and free would find another bucket.
 * Scan all buckets when detecting leaks.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
+  - Note that we tested sequential mmap/munmap on Linux and it picked the same
+    memory address every time.
 * On invalid free, print nearest allocation/deallocation stack trace
 * Do the memory protection for bucket metadata too
 * Catch the error when wrong size or wrong alignment is given to free or realloc/shrink.

@@ -252,17 +252,20 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             const addr = @ptrToInt(slice.ptr);
             const aligned_addr = std.mem.alignForward(addr, alignment);
 
-            // We can unmap the unused portions of our mmap, but we must only
-            // pass munmap bytes that exist outside our allocated pages or it
-            // will happily eat us too.
+            // Unmap the extra bytes that were only requested in order to guarantee
+            // that the range of memory we were provided had a proper alignment in
+            // it somewhere. The extra bytes could be at the beginning, or end, or both.
+            const unused_start = slice[0..aligned_addr - addr];
+            if (unused_start.len != 0) {
+                self.sysFree(unused_start);
+            }
+            const aligned_end_addr = std.mem.alignForward(aligned_addr + n, page_size);
+            const unused_end_len = @ptrToInt(slice.ptr + slice.len) - aligned_end_addr;
+            const unused_end = @intToPtr([*]u8, aligned_end_addr)[0..unused_end_len];
+            if (unused_end.len != 0) {
+                self.sysFree(unused_end);
+            }
 
-            // Since alignment > page_size, we are by definition on a page boundary.
-            const unused_len = aligned_addr - 1 - addr;
-
-            self.sysFree(slice[0..unused_len]);
-
-            // It is impossible that there is an unoccupied page at the top of our
-            // mmap.
             const result = @intToPtr([*]u8, aligned_addr)[0..n];
             try self.trackLargeAlloc(result, first_trace_addr);
             return result;
@@ -461,12 +464,9 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
 
                     const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
                     const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
-                    if (new_size <= end_page) {
-                        if (new_align > old_align) {
-                            // TODO test if the pointer happens to be already aligned to new_align
-                            @panic("TODO handle re-alignment");
-                        }
-
+                    if (new_size <= end_page and (new_align <= old_align or
+                        isAligned(@ptrToInt(old_mem.ptr), new_align)))
+                    {
                         const result = old_mem.ptr[0..new_size];
                         // TODO test if the old_mem.len is correct
                         old_kv.value.bytes = result;
@@ -949,4 +949,63 @@ test "backing allocator" {
 
     const ptr = try allocator.create(i32);
     defer allocator.destroy(ptr);
+}
+
+test "realloc large object to larger alignment" {
+    const gpda = try GeneralPurposeDebugAllocator(test_config).create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var debug_buffer: [1000]u8 = undefined;
+    const debug_allocator = &std.heap.FixedBufferAllocator.init(&debug_buffer).allocator;
+
+    var slice = try allocator.alignedAlloc(u8, 16, page_size * 2 + 50);
+    defer allocator.free(slice);
+
+    var stuff_to_free = std.ArrayList([]align(16) u8).init(debug_allocator);
+    while (isAligned(@ptrToInt(slice.ptr), page_size * 2)) {
+        try stuff_to_free.append(slice);
+        slice = try allocator.alignedAlloc(u8, 16, page_size * 2 + 50);
+    }
+    while (stuff_to_free.popOrNull()) |item| {
+        allocator.free(item);
+    }
+    slice[0] = 0x12;
+    slice[16] = 0x34;
+
+    slice = try allocator.alignedRealloc(slice, 32, page_size * 2 + 100);
+    assert(slice[0] == 0x12);
+    assert(slice[16] == 0x34);
+
+    slice = try allocator.alignedRealloc(slice, 32, page_size * 2 + 25);
+    assert(slice[0] == 0x12);
+    assert(slice[16] == 0x34);
+
+    slice = try allocator.alignedRealloc(slice, page_size * 2, page_size * 2 + 100);
+    assert(slice[0] == 0x12);
+    assert(slice[16] == 0x34);
+}
+
+fn isAligned(addr: usize, alignment: usize) bool {
+    // 000010000 // example addr
+    // 000001111 // subtract 1
+    // 111110000 // binary not
+    const aligned_addr = (addr & ~(alignment - 1));
+    return aligned_addr == addr;
+}
+
+test "isAligned works" {
+    assert(isAligned(0, 4));
+    assert(isAligned(1, 1));
+    assert(isAligned(2, 1));
+    assert(isAligned(2, 2));
+    assert(!isAligned(2, 4));
+    assert(isAligned(3, 1));
+    assert(!isAligned(3, 2));
+    assert(!isAligned(3, 4));
+    assert(isAligned(4, 4));
+    assert(isAligned(4, 2));
+    assert(isAligned(4, 1));
+    assert(!isAligned(4, 8));
+    assert(!isAligned(4, 16));
 }
