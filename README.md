@@ -123,7 +123,6 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
-* Handle the case when realloc sized down and free would find another bucket.
 * Scan all buckets when detecting leaks.
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.

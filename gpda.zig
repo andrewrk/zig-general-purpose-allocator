@@ -353,7 +353,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             bucket_index: usize,
             addr: usize,
         ) ?*BucketHeader {
-            const first_bucket = self.buckets[bucket_index].?;
+            const first_bucket = self.buckets[bucket_index] orelse return null;
             var bucket = first_bucket;
             while (true) {
                 const in_bucket_range = (addr >= @ptrToInt(bucket.page) and
@@ -428,6 +428,60 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return result;
         }
 
+        /// This function assumes the object is in the large object storage regardless
+        /// of the parameters.
+        fn resizeLarge(
+            self: *Self,
+            old_mem: []u8,
+            old_align: u29,
+            new_size: usize,
+            new_align: u29,
+            return_addr: usize,
+            behavior: ResizeBehavior,
+        ) Error![]u8 {
+            if (new_size == 0) {
+                self.directFree(old_mem);
+                return old_mem[0..0];
+            } else if (new_size > old_mem.len or new_align > old_align) {
+                self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
+                defer self.mprotectLargeAllocs(posix.PROT_READ);
+
+                const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
+                const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
+                if (new_size <= end_page and (new_align <= old_align or
+                    isAligned(@ptrToInt(old_mem.ptr), new_align)))
+                {
+                    const result = old_mem.ptr[0..new_size];
+                    // TODO test if the old_mem.len is correct
+                    old_kv.value.bytes = result;
+                    collectStackTrace(return_addr, &old_kv.value.stack_addresses);
+                    return result;
+                }
+                const new_mem = try self.directAlloc(new_size, new_align, return_addr);
+                @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
+                self.directFree(old_mem);
+                return new_mem;
+            } else {
+                const new_aligned_size = std.math.max(new_size, new_align);
+                if (new_aligned_size > largest_bucket_object_size) {
+                    return self.directRealloc(old_mem, new_size, return_addr, behavior);
+                } else {
+                    const new_size_class = up_to_nearest_power_of_2(usize, new_aligned_size);
+                    const ptr = self.allocSlot(new_size_class, return_addr) catch |e| switch (e) {
+                        error.OutOfMemory => return self.directRealloc(
+                            old_mem,
+                            new_size,
+                            return_addr,
+                            behavior,
+                        ),
+                    };
+                    @memcpy(ptr, old_mem.ptr, new_size);
+                    self.directFree(old_mem);
+                    return ptr[0..new_size];
+                }
+            }
+        }
+
         fn reallocOrShrink(
             allocator: *Allocator,
             old_mem: []u8,
@@ -455,47 +509,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
 
             const aligned_size = std.math.max(old_mem.len, old_align);
             if (aligned_size > largest_bucket_object_size) {
-                if (new_size == 0) {
-                    self.directFree(old_mem);
-                    return old_mem[0..0];
-                } else if (new_size > old_mem.len or new_align > old_align) {
-                    self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-                    defer self.mprotectLargeAllocs(posix.PROT_READ);
-
-                    const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
-                    const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
-                    if (new_size <= end_page and (new_align <= old_align or
-                        isAligned(@ptrToInt(old_mem.ptr), new_align)))
-                    {
-                        const result = old_mem.ptr[0..new_size];
-                        // TODO test if the old_mem.len is correct
-                        old_kv.value.bytes = result;
-                        collectStackTrace(return_addr, &old_kv.value.stack_addresses);
-                        return result;
-                    }
-                    const new_mem = try self.directAlloc(new_size, new_align, return_addr);
-                    @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
-                    self.directFree(old_mem);
-                    return new_mem;
-                } else {
-                    const new_aligned_size = std.math.max(new_size, new_align);
-                    if (new_aligned_size > largest_bucket_object_size) {
-                        return self.directRealloc(old_mem, new_size, return_addr, behavior);
-                    } else {
-                        const new_size_class = up_to_nearest_power_of_2(usize, new_aligned_size);
-                        const ptr = self.allocSlot(new_size_class, return_addr) catch |e| switch (e) {
-                            error.OutOfMemory => return self.directRealloc(
-                                old_mem,
-                                new_size,
-                                return_addr,
-                                behavior,
-                            ),
-                        };
-                        @memcpy(ptr, old_mem.ptr, new_size);
-                        self.directFree(old_mem);
-                        return ptr[0..new_size];
-                    }
-                }
+                return self.resizeLarge(old_mem, old_align, new_size, new_align, return_addr, behavior);
             }
             const size_class = up_to_nearest_power_of_2(usize, aligned_size);
 
@@ -505,7 +519,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                     break bucket;
                 }
             } else {
-                @panic("handle realloc/shrink of large object");
+                return self.resizeLarge(old_mem, old_align, new_size, new_align, return_addr, behavior);
             };
             const byte_offset = @ptrToInt(old_mem.ptr) - @ptrToInt(bucket.page);
             const slot_index = byte_offset / size_class;
@@ -1008,4 +1022,27 @@ test "isAligned works" {
     assert(isAligned(4, 1));
     assert(!isAligned(4, 8));
     assert(!isAligned(4, 16));
+}
+
+test "large object shrinks to small but allocation fails during shrink" {
+    const direct_allocator = &std.heap.DirectAllocator.init().allocator;
+    var failing_allocator = std.debug.FailingAllocator.init(direct_allocator, 3);
+    const gpda = try GeneralPurposeDebugAllocator(Config{
+        .stack_trace_frames = 4,
+        .backing_allocator = true,
+        .memory_protection = false,
+    }).createWithAllocator(&failing_allocator.allocator);
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var slice = try allocator.alloc(u8, page_size * 2 + 50);
+    defer allocator.free(slice);
+    slice[0] = 0x12;
+    slice[3] = 0x34;
+
+    // Next allocation will fail in the backing allocator of the GeneralPurposeDebugAllocator
+
+    slice = allocator.shrink(slice, 4);
+    assert(slice[0] == 0x12);
+    assert(slice[3] == 0x34);
 }
