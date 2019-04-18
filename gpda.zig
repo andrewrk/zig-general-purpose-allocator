@@ -194,33 +194,47 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             os.posixMProtect(@ptrToInt(self), page_size, protection) catch unreachable;
         }
 
+        fn detectLeaksInBucket(
+            bucket: *BucketHeader,
+            size_class: usize,
+            used_bits_count: usize,
+        ) void {
+            var used_bits_byte: usize = 0;
+            while (used_bits_byte < used_bits_count) : (used_bits_byte += 1) {
+                const used_byte = bucket.usedBits(used_bits_byte).*;
+                if (used_byte != 0) {
+                    var bit_index: u3 = 0;
+                    while (true) : (bit_index += 1) {
+                        const is_used = @truncate(u1, used_byte >> bit_index) != 0;
+                        if (is_used) {
+                            std.debug.warn("\nMemory leak detected:\n");
+                            const slot_index = used_bits_byte * 8 + bit_index;
+                            const stack_trace = bucketStackTrace(
+                                bucket,
+                                size_class,
+                                slot_index,
+                                .Alloc,
+                            );
+                            std.debug.dumpStackTrace(stack_trace);
+                        }
+                        if (bit_index == std.math.maxInt(u3))
+                            break;
+                    }
+                }
+            }
+        }
+
         pub fn destroy(self: *Self) void {
             for (self.buckets) |optional_bucket, bucket_i| {
-                const bucket = optional_bucket orelse continue;
+                const first_bucket = optional_bucket orelse continue;
                 const size_class = usize(1) << @intCast(u6, bucket_i);
                 const used_bits_count = usedBitsCount(size_class);
-                var used_bits_byte: usize = 0;
-                while (used_bits_byte < used_bits_count) : (used_bits_byte += 1) {
-                    const used_byte = bucket.usedBits(used_bits_byte).*;
-                    if (used_byte != 0) {
-                        var bit_index: u3 = 0;
-                        while (true) : (bit_index += 1) {
-                            const is_used = @truncate(u1, used_byte >> bit_index) != 0;
-                            if (is_used) {
-                                std.debug.warn("\nMemory leak detected:\n");
-                                const slot_index = used_bits_byte * 8 + bit_index;
-                                const stack_trace = bucketStackTrace(
-                                    bucket,
-                                    size_class,
-                                    slot_index,
-                                    .Alloc,
-                                );
-                                std.debug.dumpStackTrace(stack_trace);
-                            }
-                            if (bit_index == std.math.maxInt(u3))
-                                break;
-                        }
-                    }
+                var bucket = first_bucket;
+                while (true) {
+                    detectLeaksInBucket(bucket, size_class, used_bits_count);
+                    bucket = bucket.next;
+                    if (bucket == first_bucket)
+                        break;
                 }
             }
             var large_it = self.large_allocations.iterator();

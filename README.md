@@ -123,11 +123,12 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
-* Scan all buckets when detecting leaks.
+* Validation fuzz testing
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
   - Note that we tested sequential mmap/munmap on Linux and it picked the same
     memory address every time.
+* Implement handling of multiple threads.
 * On invalid free, print nearest allocation/deallocation stack trace
 * Do the memory protection for bucket metadata too
 * Catch the error when wrong size or wrong alignment is given to free or realloc/shrink.
@@ -135,12 +136,10 @@ is memory protected with the same strategy as the allocator's state.
   * Requested Bytes Allocated (total of n for every alloc minus n for every free)
   * Resident Bytes (pagesize * number of pages mmapped for slots)
   * Overhead Bytes (how much memory the allocator state is using)
-* Validation fuzz testing
 * Performance benchmarking
   * Do we need meta-buckets?
 * Iterate over usize instead of u8 for used bits
 * Port to Windows
-* Implement handling of multiple threads.
 * When configured to be non-thread-safe, then detect usage with multiple threads,
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
