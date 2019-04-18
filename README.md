@@ -124,6 +124,11 @@ is memory protected with the same strategy as the allocator's state.
 ## Roadmap
 
 * Validation fuzz testing
+  - vary the size and alignment of allocations
+  - vary the number of and kind of operations in between allocations and
+    corresponding frees
+  - vary whether or not the backing allocator succeeds
+  - how much memory capacity it goes up to
 * Make allocations favor iterating forward over slots. Favor using new slots in
   the same memory page over reusing freed slots.
   - Note that we tested sequential mmap/munmap on Linux and it picked the same

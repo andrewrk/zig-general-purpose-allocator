@@ -177,6 +177,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
 
         fn usedBitsCount(size_class: usize) usize {
             const slot_count = @divExact(page_size, size_class);
+            if (slot_count < 8) return 1;
             return @divExact(slot_count, 8);
         }
 
@@ -799,6 +800,12 @@ const test_config = Config{
     .memory_protection = true,
 };
 
+const test_config_nomprotect = Config{
+    .stack_trace_frames = 4,
+    .backing_allocator = false,
+    .memory_protection = false,
+};
+
 test "small allocations - free in same order" {
     const gpda = try GeneralPurposeDebugAllocator(test_config).create();
     defer gpda.destroy();
@@ -1059,4 +1066,16 @@ test "large object shrinks to small but allocation fails during shrink" {
     slice = allocator.shrink(slice, 4);
     assert(slice[0] == 0x12);
     assert(slice[3] == 0x34);
+}
+
+test "objects of size 1024 and 2048" {
+    const gpda = try GeneralPurposeDebugAllocator(test_config).create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    const slice = try allocator.alloc(u8, 1025);
+    const slice2 = try allocator.alloc(u8, 3000);
+
+    allocator.free(slice);
+    allocator.free(slice2);
 }
