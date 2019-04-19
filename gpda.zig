@@ -473,7 +473,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                     return result;
                 }
                 const new_mem = try self.directAlloc(new_size, new_align, return_addr);
-                @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
+                @memcpy(new_mem.ptr, old_mem.ptr, std.math.min(old_mem.len, new_mem.len));
                 self.directFree(old_mem);
                 return new_mem;
             } else {
@@ -954,6 +954,34 @@ test "shrink large object to large object" {
     assert(slice[60] == 0x34);
 
     slice = try allocator.realloc(slice, page_size * 2);
+    assert(slice[0] == 0x12);
+    assert(slice[60] == 0x34);
+}
+
+test "shrink large object to large object with larger alignment" {
+    const gpda = try GeneralPurposeDebugAllocator(test_config).create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    var debug_buffer: [1000]u8 = undefined;
+    const debug_allocator = &std.heap.FixedBufferAllocator.init(&debug_buffer).allocator;
+
+    const alloc_size = page_size * 2 + 50;
+    var slice = try allocator.alignedAlloc(u8, 16, alloc_size);
+    defer allocator.free(slice);
+
+    var stuff_to_free = std.ArrayList([]align(16) u8).init(debug_allocator);
+    while (isAligned(@ptrToInt(slice.ptr), page_size * 2)) {
+        try stuff_to_free.append(slice);
+        slice = try allocator.alignedAlloc(u8, 16, alloc_size);
+    }
+    while (stuff_to_free.popOrNull()) |item| {
+        allocator.free(item);
+    }
+    slice[0] = 0x12;
+    slice[60] = 0x34;
+
+    slice = try allocator.alignedRealloc(slice, page_size * 2, alloc_size / 2);
     assert(slice[0] == 0x12);
     assert(slice[60] == 0x34);
 }
