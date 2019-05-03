@@ -15,7 +15,9 @@ into the [Zig](https://ziglang.org/) standard library, with the focus on these g
  * Detect leaks and print stack trace of:
    - Where it was allocated
 
- * Unmap freed memory as soon as possible to cause page faults when used.
+ * When a page of memory is no longer needed, give it back to resident memory,
+   but keep it mapped with no permissions (read/write/exec) so that it causes
+   page faults when used.
 
  * Make pointer math errors unlikely to harm memory from
    unrelated allocations
@@ -123,24 +125,31 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
+* Ability to print stats
+  * Requested Bytes Allocated (total of n for every alloc minus n for every free)
+  * Resident Bytes (pagesize * number of pages mmapped for slots)
+  * Overhead Bytes (how much memory the allocator state is using)
 * Validation fuzz testing
   - vary the size and alignment of allocations
   - vary the number of and kind of operations in between allocations and
     corresponding frees
   - vary whether or not the backing allocator succeeds
   - how much memory capacity it goes up to
-* Make allocations favor iterating forward over slots. Favor using new slots in
-  the same memory page over reusing freed slots.
-  - Note that we tested sequential mmap/munmap on Linux and it picked the same
-    memory address every time.
+* For small objects, instead of unmapping memory, keep the memory mapped but
+  give the resident memory back.
+* For small objects, do not re-use slots. Allocate new pages instead.
+* When allocating new pages for small objects, if virtual address space is
+  exhausted, fall back to using the oldest freed memory, whether that be
+  unused pages, or freed slots.
+* When falling back to old unused pages, if we get an error from the OS from
+  reactivating the page, then fall back to a freed slot.
+* For large objects, instead of unmapping memory, keep the memory mapped but
+  give the resident memory back.
+    - What if all the address space is used? A plan for unmapping at some point.
 * Implement handling of multiple threads.
 * On invalid free, print nearest allocation/deallocation stack trace
 * Do the memory protection for bucket metadata too
 * Catch the error when wrong size or wrong alignment is given to free or realloc/shrink.
-* Ability to print stats
-  * Requested Bytes Allocated (total of n for every alloc minus n for every free)
-  * Resident Bytes (pagesize * number of pages mmapped for slots)
-  * Overhead Bytes (how much memory the allocator state is using)
 * Performance benchmarking
   * Do we need meta-buckets?
 * Iterate over usize instead of u8 for used bits
@@ -148,7 +157,6 @@ is memory protected with the same strategy as the allocator's state.
 * When configured to be non-thread-safe, then detect usage with multiple threads,
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
-* Ability to specify maximum memory usage before returning OutOfMemory
 * Make `std.HashMap` return bytes back to the allocator when the hash map gets
   smaller.
 * Make deallocated but still mapped bytes be `0xdd`.

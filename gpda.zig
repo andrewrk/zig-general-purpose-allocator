@@ -33,6 +33,9 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         simple_allocator: SimpleAllocatorType,
         large_allocations: LargeAllocTable,
 
+        total_requested_bytes: usize,
+        requested_memory_limit: usize,
+
         comptime {
             if (config.backing_allocator and config.memory_protection) {
                 @compileError("Memory protection is unavailable when using a backing allocator");
@@ -89,9 +92,12 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 .buckets = [1]?*BucketHeader{null} ** small_bucket_count,
                 .simple_allocator = if (config.backing_allocator) {} else SimpleAllocator.init(),
                 .large_allocations = LargeAllocTable.init(if (config.backing_allocator)
-                        backing_allocator
-                    else
-                        &self.simple_allocator.allocator),
+                    backing_allocator
+                else
+                    &self.simple_allocator.allocator),
+
+                .total_requested_bytes = 0,
+                .requested_memory_limit = std.math.maxInt(usize),
             };
             try self.mprotectInit(posix.PROT_READ);
             return self;
@@ -270,7 +276,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             // Unmap the extra bytes that were only requested in order to guarantee
             // that the range of memory we were provided had a proper alignment in
             // it somewhere. The extra bytes could be at the beginning, or end, or both.
-            const unused_start = slice[0..aligned_addr - addr];
+            const unused_start = slice[0 .. aligned_addr - addr];
             if (unused_start.len != 0) {
                 self.sysFree(unused_start);
             }
@@ -497,6 +503,13 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             }
         }
 
+        pub fn setRequestedMemoryLimit(self: *Self, limit: usize) void {
+            self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
+            defer self.mprotect(posix.PROT_READ);
+
+            self.requested_memory_limit = limit;
+        }
+
         fn reallocOrShrink(
             allocator: *Allocator,
             old_mem: []u8,
@@ -509,6 +522,17 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             const self = @fieldParentPtr(Self, "allocator", allocator);
             self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
             defer self.mprotect(posix.PROT_READ);
+
+            const prev_req_bytes = self.total_requested_bytes;
+            const new_req_bytes = prev_req_bytes + new_size - old_mem.len;
+            if (new_req_bytes > prev_req_bytes and
+                new_req_bytes > self.requested_memory_limit)
+            {
+                return error.OutOfMemory;
+            }
+
+            self.total_requested_bytes = new_req_bytes;
+            errdefer self.total_requested_bytes = prev_req_bytes;
 
             if (old_mem.len == 0) {
                 assert(behavior == .realloc);
@@ -1078,4 +1102,30 @@ test "objects of size 1024 and 2048" {
 
     allocator.free(slice);
     allocator.free(slice2);
+}
+
+test "setting a memory cap" {
+    const gpda = try GeneralPurposeDebugAllocator(test_config).create();
+    defer gpda.destroy();
+    const allocator = &gpda.allocator;
+
+    gpda.setRequestedMemoryLimit(1010);
+
+    const small = try allocator.create(i32);
+    assert(gpda.total_requested_bytes == 4);
+
+    const big = try allocator.alloc(u8, 1000);
+    assert(gpda.total_requested_bytes == 1004);
+
+    std.testing.expectError(error.OutOfMemory, allocator.create(u64));
+
+    allocator.destroy(small);
+    assert(gpda.total_requested_bytes == 1000);
+
+    allocator.free(big);
+    assert(gpda.total_requested_bytes == 0);
+
+    const exact = try allocator.alloc(u8, 1010);
+    assert(gpda.total_requested_bytes == 1010);
+    allocator.free(exact);
 }

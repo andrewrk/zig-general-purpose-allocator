@@ -31,7 +31,7 @@ test "fuzz testing" {
         const is_small = rand.boolean();
         const size = if (is_small)
             rand.uintLessThanBiased(usize, std.os.page_size)
-        else 
+        else
             std.os.page_size + rand.uintLessThanBiased(usize, 10 * 1024 * 1024);
 
         const iterations_until_free = rand.uintLessThanBiased(usize, 100);
@@ -54,7 +54,6 @@ test "fuzz testing" {
             }
             free_i += 1;
         }
-        std.debug.warn("index={} allocated: {Bi2} freed: {Bi2}\n",
-            it_index, allocated_n, freed_n);
+        std.debug.warn("index={} allocated: {Bi2} freed: {Bi2}\n", it_index, allocated_n, freed_n);
     }
 }
