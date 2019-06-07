@@ -3,8 +3,7 @@ const os = std.os;
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const page_size = std.os.page_size;
-const posix = std.os.posix;
+const page_size = std.mem.page_size;
 
 pub const Config = struct {
     /// Number of stack frames to capture. Default: 4
@@ -99,7 +98,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 .total_requested_bytes = 0,
                 .requested_memory_limit = std.math.maxInt(usize),
             };
-            try self.mprotectInit(posix.PROT_READ);
+            try self.mprotectInit(os.PROT_READ);
             return self;
         }
 
@@ -189,7 +188,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
 
         fn mprotectInit(self: *Self, protection: u32) Error!void {
             if (!config.memory_protection) return;
-            os.posixMProtect(@ptrToInt(self), page_size, protection) catch |e| switch (e) {
+            const slice = @intToPtr([*]align(page_size) u8, @ptrToInt(self))[0..page_size];
+            os.mprotect(slice, protection) catch |e| switch (e) {
                 error.AccessDenied => unreachable,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Unexpected => return error.OutOfMemory,
@@ -198,7 +198,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
 
         fn mprotect(self: *Self, protection: u32) void {
             if (!config.memory_protection) return;
-            os.posixMProtect(@ptrToInt(self), page_size, protection) catch unreachable;
+            const slice = @intToPtr([*]align(page_size) u8, @ptrToInt(self))[0..page_size];
+            os.mprotect(slice, protection) catch unreachable;
         }
 
         fn detectLeaksInBucket(
@@ -260,8 +261,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             alignment: u29,
             first_trace_addr: usize,
         ) Error![]u8 {
-            const p = posix;
-            const alloc_size = if (alignment <= os.page_size) n else n + alignment;
+            const alloc_size = if (alignment <= page_size) n else n + alignment;
             const slice = try self.sysAlloc(alloc_size);
             errdefer self.sysFree(slice);
 
@@ -303,8 +303,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             bytes: []u8,
             first_trace_addr: usize,
         ) !void {
-            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.mprotectLargeAllocs(posix.PROT_READ);
+            self.mprotectLargeAllocs(os.PROT_WRITE | os.PROT_READ);
+            defer self.mprotectLargeAllocs(os.PROT_READ);
 
             const gop = try self.large_allocations.getOrPut(@ptrToInt(bytes.ptr));
             if (gop.found_existing) {
@@ -431,8 +431,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return_addr: usize,
             behavior: ResizeBehavior,
         ) Error![]u8 {
-            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.mprotectLargeAllocs(posix.PROT_READ);
+            self.mprotectLargeAllocs(os.PROT_WRITE | os.PROT_READ);
+            defer self.mprotectLargeAllocs(os.PROT_READ);
 
             const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
             const result = old_mem.ptr[0..new_size];
@@ -464,8 +464,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 self.directFree(old_mem);
                 return old_mem[0..0];
             } else if (new_size > old_mem.len or new_align > old_align) {
-                self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-                defer self.mprotectLargeAllocs(posix.PROT_READ);
+                self.mprotectLargeAllocs(os.PROT_WRITE | os.PROT_READ);
+                defer self.mprotectLargeAllocs(os.PROT_READ);
 
                 const old_kv = self.large_allocations.get(@ptrToInt(old_mem.ptr)).?;
                 const end_page = std.mem.alignForward(old_kv.value.bytes.len, page_size);
@@ -504,8 +504,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         }
 
         pub fn setRequestedMemoryLimit(self: *Self, limit: usize) void {
-            self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.mprotect(posix.PROT_READ);
+            self.mprotect(os.PROT_WRITE | os.PROT_READ);
+            defer self.mprotect(os.PROT_READ);
 
             self.requested_memory_limit = limit;
         }
@@ -520,8 +520,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             behavior: ResizeBehavior,
         ) Error![]u8 {
             const self = @fieldParentPtr(Self, "allocator", allocator);
-            self.mprotect(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.mprotect(posix.PROT_READ);
+            self.mprotect(os.PROT_WRITE | os.PROT_READ);
+            defer self.mprotect(os.PROT_READ);
 
             const prev_req_bytes = self.total_requested_bytes;
             const new_req_bytes = prev_req_bytes + new_size - old_mem.len;
@@ -594,8 +594,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 return old_mem.ptr[0..new_size];
             }
             if (new_aligned_size > largest_bucket_object_size) {
-                self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-                defer self.mprotectLargeAllocs(posix.PROT_READ);
+                self.mprotectLargeAllocs(os.PROT_WRITE | os.PROT_READ);
+                defer self.mprotectLargeAllocs(os.PROT_READ);
 
                 const new_mem = try self.directAlloc(new_size, new_align, return_addr);
                 @memcpy(new_mem.ptr, old_mem.ptr, old_mem.len);
@@ -631,8 +631,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         }
 
         fn directFree(self: *Self, bytes: []u8) void {
-            self.mprotectLargeAllocs(posix.PROT_WRITE | posix.PROT_READ);
-            defer self.mprotectLargeAllocs(posix.PROT_READ);
+            self.mprotectLargeAllocs(os.PROT_WRITE | os.PROT_READ);
+            defer self.mprotectLargeAllocs(os.PROT_READ);
 
             var kv = self.large_allocations.remove(@ptrToInt(bytes.ptr)).?;
             if (bytes.len != kv.value.bytes.len) {
@@ -714,11 +714,9 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             if (config.backing_allocator) {
                 return self.backing_allocator.alignedAlloc(u8, page_size, len);
             } else {
-                const perms = posix.PROT_READ | posix.PROT_WRITE;
-                const flags = posix.MAP_PRIVATE | posix.MAP_ANONYMOUS;
-                const addr = posix.mmap(null, len, perms, flags, -1, 0);
-                if (addr == posix.MAP_FAILED) return error.OutOfMemory;
-                return @intToPtr([*]align(page_size) u8, addr)[0..len];
+                const perms = os.PROT_READ | os.PROT_WRITE;
+                const flags = os.MAP_PRIVATE | os.MAP_ANONYMOUS;
+                return os.mmap(null, len, perms, flags, -1, 0) catch return error.OutOfMemory;
             }
         }
 
@@ -726,7 +724,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             if (config.backing_allocator) {
                 return self.backing_allocator.free(old_mem);
             } else {
-                assert(posix.getErrno(posix.munmap(@ptrToInt(old_mem.ptr), old_mem.len)) == 0);
+                os.munmap(@alignCast(page_size, old_mem));
             }
         }
 
@@ -783,11 +781,10 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             pub fn mprotect(self: *SimpleAllocator, protection: u32) void {
                 if (!config.memory_protection) return;
                 if (self.active_allocation.len == 0) return;
-                os.posixMProtect(
-                    @ptrToInt(self.active_allocation.ptr),
-                    std.mem.alignForward(self.active_allocation.len, page_size),
-                    protection,
-                ) catch unreachable;
+                const aligned_ptr = @alignCast(page_size, self.active_allocation.ptr);
+                const aligned_len = std.mem.alignForward(self.active_allocation.len, page_size);
+                const slice = aligned_ptr[0..aligned_len];
+                os.mprotect(slice, protection) catch unreachable;
             }
         };
     };
