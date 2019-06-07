@@ -1,11 +1,7 @@
 const std = @import("std");
 const gpda_module = @import("gpda.zig");
 
-const test_config = gpda_module.Config{
-    .stack_trace_frames = 4,
-    .backing_allocator = false,
-    .memory_protection = true,
-};
+const test_config = gpda_module.Config{};
 
 test "double free" {
     const gpda = try gpda_module.GeneralPurposeDebugAllocator(test_config).create();

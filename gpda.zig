@@ -6,22 +6,20 @@ const Allocator = std.mem.Allocator;
 const page_size = std.mem.page_size;
 
 pub const Config = struct {
-    /// Number of stack frames to capture. Default: 4
-    /// TODO https://github.com/ziglang/zig/issues/485
-    stack_trace_frames: usize,
+    /// Number of stack frames to capture.
+    stack_trace_frames: usize = 4,
 
     /// Whether the allocator is configured to accept a backing
-    /// allocator used for the underlying memory. Default is
-    /// false, which means it will make syscalls directly, and
+    /// allocator used for the underlying memory.
+    /// false means it will make syscalls directly, and
     /// the create() function takes no arguments.
     /// If this is set to true, create() takes a *Allocator parameter.
-    backing_allocator: bool,
+    backing_allocator: bool = false,
 
     /// Whether to use mprotect to take away write permission
     /// from allocator internal state to prevent allocator state
     /// corruption. Enabling this catches bugs but is slower.
-    /// Default: true
-    memory_protection: bool,
+    memory_protection: bool = true,
 };
 
 pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
@@ -815,17 +813,9 @@ fn eql_addr(a: usize, b: usize) bool {
     return a == b;
 }
 
-const test_config = Config{
-    .stack_trace_frames = 4,
-    .backing_allocator = false,
-    .memory_protection = true,
-};
+const test_config = Config{};
 
-const test_config_nomprotect = Config{
-    .stack_trace_frames = 4,
-    .backing_allocator = false,
-    .memory_protection = false,
-};
+const test_config_nomprotect = Config{ .memory_protection = false };
 
 test "small allocations - free in same order" {
     const gpda = try GeneralPurposeDebugAllocator(test_config).create();
@@ -1024,7 +1014,6 @@ test "realloc large object to small object" {
 
 test "backing allocator" {
     const gpda = try GeneralPurposeDebugAllocator(Config{
-        .stack_trace_frames = 4,
         .backing_allocator = true,
         .memory_protection = false,
     }).createWithAllocator(std.debug.global_allocator);
@@ -1098,7 +1087,6 @@ test "large object shrinks to small but allocation fails during shrink" {
     const direct_allocator = &std.heap.DirectAllocator.init().allocator;
     var failing_allocator = std.debug.FailingAllocator.init(direct_allocator, 3);
     const gpda = try GeneralPurposeDebugAllocator(Config{
-        .stack_trace_frames = 4,
         .backing_allocator = true,
         .memory_protection = false,
     }).createWithAllocator(&failing_allocator.allocator);
