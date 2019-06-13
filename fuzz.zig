@@ -26,9 +26,9 @@ test "fuzz testing" {
     while (true) : (it_index += 1) {
         const is_small = rand.boolean();
         const size = if (is_small)
-            rand.uintLessThanBiased(usize, std.os.page_size)
+            rand.uintLessThanBiased(usize, std.mem.page_size)
         else
-            std.os.page_size + rand.uintLessThanBiased(usize, 10 * 1024 * 1024);
+            std.mem.page_size + rand.uintLessThanBiased(usize, 10 * 1024 * 1024);
 
         const iterations_until_free = rand.uintLessThanBiased(usize, 100);
         const slice = allocator.alloc(u8, size) catch unreachable;

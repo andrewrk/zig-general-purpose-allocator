@@ -135,17 +135,11 @@ is memory protected with the same strategy as the allocator's state.
     corresponding frees
   - vary whether or not the backing allocator succeeds
   - how much memory capacity it goes up to
-* For small objects, instead of unmapping memory, keep the memory mapped but
-  give the resident memory back.
-* For small objects, do not re-use slots. Allocate new pages instead.
 * When allocating new pages for small objects, if virtual address space is
   exhausted, fall back to using the oldest freed memory, whether that be
   unused pages, or freed slots.
 * When falling back to old unused pages, if we get an error from the OS from
   reactivating the page, then fall back to a freed slot.
-* For large objects, instead of unmapping memory, keep the memory mapped but
-  give the resident memory back.
-    - What if all the address space is used? A plan for unmapping at some point.
 * Implement handling of multiple threads.
 * On invalid free, print nearest allocation/deallocation stack trace
 * Do the memory protection for bucket metadata too
@@ -165,3 +159,6 @@ is memory protected with the same strategy as the allocator's state.
   for large objects.
 * Test whether it is an improvement to try to use an mmap hint when growing
   a large object and it has to mmap more.
+* What if all the address space is used? A plan for unmapping at some point.
+* Once a bucket becomes full, remove it from the linked list of buckets that are
+  used to find allocation slots.

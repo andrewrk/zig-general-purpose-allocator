@@ -5,6 +5,9 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const page_size = std.mem.page_size;
 
+/// Integer type for pointing to slots in a small allocation
+const SlotIndex = @IntType(false, std.math.log2(page_size) + 1);
+
 pub const Config = struct {
     /// Number of stack frames to capture.
     stack_trace_frames: usize = 4,
@@ -116,8 +119,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             prev: *BucketHeader,
             next: *BucketHeader,
             page: [*]align(page_size) u8,
-            used_bits_index: usize,
-            used_count: usize,
+            alloc_cursor: SlotIndex,
+            used_count: SlotIndex,
 
             fn usedBits(bucket: *BucketHeader, index: usize) *u8 {
                 return @intToPtr(*u8, @ptrToInt(bucket) + @sizeOf(BucketHeader) + index);
@@ -126,7 +129,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             fn stackTracePtr(
                 bucket: *BucketHeader,
                 size_class: usize,
-                slot_index: usize,
+                slot_index: SlotIndex,
                 trace_kind: TraceKind,
             ) *[stack_n]usize {
                 const start_ptr = @ptrCast([*]u8, bucket) + bucketStackFramesStart(size_class);
@@ -139,7 +142,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 bucket: *BucketHeader,
                 return_address: usize,
                 size_class: usize,
-                slot_index: usize,
+                slot_index: SlotIndex,
                 trace_kind: TraceKind,
             ) void {
                 // Initialize them to 0. When determining the count we must look
@@ -152,7 +155,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
         fn bucketStackTrace(
             bucket: *BucketHeader,
             size_class: usize,
-            slot_index: usize,
+            slot_index: SlotIndex,
             trace_kind: TraceKind,
         ) builtin.StackTrace {
             const stack_addresses = bucket.stackTracePtr(size_class, slot_index, trace_kind);
@@ -214,7 +217,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                         const is_used = @truncate(u1, used_byte >> bit_index) != 0;
                         if (is_used) {
                             std.debug.warn("\nMemory leak detected:\n");
-                            const slot_index = used_bits_byte * 8 + bit_index;
+                            const slot_index = @intCast(SlotIndex, used_bits_byte * 8 + bit_index);
                             const stack_trace = bucketStackTrace(
                                 bucket,
                                 size_class,
@@ -332,7 +335,8 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 bucket_index,
             );
             var bucket = first_bucket;
-            while (bucket.used_count == usize(page_size) >> @intCast(u6, bucket_index)) {
+            const slot_count = @divExact(page_size, size_class);
+            while (bucket.alloc_cursor == slot_count) {
                 const prev_bucket = bucket;
                 bucket = prev_bucket.next;
                 if (bucket == first_bucket) {
@@ -347,23 +351,14 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             // change the allocator's current bucket to be this one
             self.buckets[bucket_index] = bucket;
 
-            bucket.used_count += 1;
-            var used_bits_byte = bucket.usedBits(bucket.used_bits_index);
-            while (used_bits_byte.* == 0xff) {
-                bucket.used_bits_index = (bucket.used_bits_index + 1) %
-                    usedBitsCount(size_class);
-                used_bits_byte = bucket.usedBits(bucket.used_bits_index);
-            }
-            var used_bit_index: u3 = 0;
-            while (@truncate(u1, used_bits_byte.* >> used_bit_index) == 1) {
-                used_bit_index += 1;
-            }
+            const slot_index = bucket.alloc_cursor;
+            bucket.alloc_cursor += 1;
 
+            var used_bits_byte = bucket.usedBits(slot_index / 8);
+            const used_bit_index: u3 = @intCast(u3, slot_index % 8); // TODO cast should be unnecessary
             used_bits_byte.* |= (u8(1) << used_bit_index);
-
-            const slot_index = bucket.used_bits_index * 8 + used_bit_index;
+            bucket.used_count += 1;
             bucket.captureStackTrace(trace_addr, size_class, slot_index, .Alloc);
-
             return bucket.page + slot_index * size_class;
         }
 
@@ -391,7 +386,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             bucket: *BucketHeader,
             bucket_index: usize,
             size_class: usize,
-            slot_index: usize,
+            slot_index: SlotIndex,
             used_byte: *u8,
             used_bit_index: u3,
             trace_addr: usize,
@@ -559,7 +554,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 return self.resizeLarge(old_mem, old_align, new_size, new_align, return_addr, behavior);
             };
             const byte_offset = @ptrToInt(old_mem.ptr) - @ptrToInt(bucket.page);
-            const slot_index = byte_offset / size_class;
+            const slot_index = @intCast(SlotIndex, byte_offset / size_class);
             const used_byte_index = slot_index / 8;
             const used_bit_index = @intCast(u3, slot_index % 8);
             const used_byte = bucket.usedBits(used_byte_index);
@@ -699,7 +694,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
                 .prev = ptr,
                 .next = ptr,
                 .page = page.ptr,
-                .used_bits_index = 0,
+                .alloc_cursor = 0,
                 .used_count = 0,
             };
             self.buckets[bucket_index] = ptr;
@@ -722,7 +717,11 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             if (config.backing_allocator) {
                 return self.backing_allocator.free(old_mem);
             } else {
-                os.munmap(@alignCast(page_size, old_mem));
+                const ptr = @alignCast(page_size, old_mem.ptr);
+                const flags = os.MAP_PRIVATE | os.MAP_ANONYMOUS | os.MAP_FIXED;
+                // This call cannot fail because we are giving the full memory back (not splitting a
+                // vm page).
+                _ = os.mmap(ptr, old_mem.len, os.PROT_NONE, flags, -1, 0) catch unreachable;
             }
         }
 
