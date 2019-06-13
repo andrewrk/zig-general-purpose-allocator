@@ -1,5 +1,5 @@
 const std = @import("std");
-const gpda_module = @import("gpda.zig");
+const gpda_module = @import("../gpda.zig");
 
 const test_config = gpda_module.Config{};
 
