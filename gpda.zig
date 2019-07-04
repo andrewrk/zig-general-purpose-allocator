@@ -263,7 +263,7 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             first_trace_addr: usize,
         ) Error![]u8 {
             const alloc_size = if (alignment <= page_size) n else n + alignment;
-            const slice = try self.sysAlloc(alloc_size);
+            const slice = try sysAlloc(self, alloc_size);
             errdefer self.sysFree(slice);
 
             if (alloc_size == n) {
@@ -683,12 +683,12 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             size_class: usize,
             bucket_index: usize,
         ) Error!*BucketHeader {
-            const page = try self.sysAlloc(page_size);
+            const page = try sysAlloc(self, page_size);
             errdefer self.sysFree(page);
 
             const bucket_size = bucketSize(size_class);
             const aligned_bucket_size = std.mem.alignForward(bucket_size, page_size);
-            const bucket_bytes = try self.sysAlloc(aligned_bucket_size);
+            const bucket_bytes = try sysAlloc(self, aligned_bucket_size);
             const ptr = @ptrCast(*BucketHeader, bucket_bytes.ptr);
             ptr.* = BucketHeader{
                 .prev = ptr,
@@ -703,13 +703,19 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             return ptr;
         }
 
+        var next_addr_hint: ?[*]align(page_size) u8 = null;
+
         fn sysAlloc(self: *Self, len: usize) Error![]align(page_size) u8 {
             if (config.backing_allocator) {
                 return self.backing_allocator.alignedAlloc(u8, page_size, len);
             } else {
                 const perms = os.PROT_READ | os.PROT_WRITE;
                 const flags = os.MAP_PRIVATE | os.MAP_ANONYMOUS;
-                return os.mmap(null, len, perms, flags, -1, 0) catch return error.OutOfMemory;
+                const hint = @atomicLoad(@typeOf(next_addr_hint), &next_addr_hint, .SeqCst);
+                const result = os.mmap(hint, len, perms, flags, -1, 0) catch return error.OutOfMemory;
+                const new_hint = result.ptr + std.mem.alignForward(result.len, page_size);
+                _ = @cmpxchgStrong(@typeOf(next_addr_hint), &next_addr_hint, hint, new_hint, .SeqCst, .SeqCst);
+                return result;
             }
         }
 
@@ -717,11 +723,9 @@ pub fn GeneralPurposeDebugAllocator(comptime config: Config) type {
             if (config.backing_allocator) {
                 return self.backing_allocator.free(old_mem);
             } else {
-                const ptr = @alignCast(page_size, old_mem.ptr);
-                const flags = os.MAP_PRIVATE | os.MAP_ANONYMOUS | os.MAP_FIXED;
                 // This call cannot fail because we are giving the full memory back (not splitting a
                 // vm page).
-                _ = os.mmap(ptr, old_mem.len, os.PROT_NONE, flags, -1, 0) catch unreachable;
+                os.munmap(@alignCast(page_size, old_mem));
             }
         }
 

@@ -125,10 +125,15 @@ is memory protected with the same strategy as the allocator's state.
 
 ## Roadmap
 
+* Port to Windows
+  - Make sure that use after free tests work.
+* Test mmap hints on other platforms:
+  - macOS
+  - FreeBSD
 * Ability to print stats
-  * Requested Bytes Allocated (total of n for every alloc minus n for every free)
-  * Resident Bytes (pagesize * number of pages mmapped for slots)
-  * Overhead Bytes (how much memory the allocator state is using)
+  - Requested Bytes Allocated (total of n for every alloc minus n for every free)
+  - Resident Bytes (pagesize * number of pages mmapped for slots)
+  - Overhead Bytes (how much memory the allocator state is using)
 * Validation fuzz testing
   - vary the size and alignment of allocations
   - vary the number of and kind of operations in between allocations and
@@ -145,9 +150,8 @@ is memory protected with the same strategy as the allocator's state.
 * Do the memory protection for bucket metadata too
 * Catch the error when wrong size or wrong alignment is given to free or realloc/shrink.
 * Performance benchmarking
-  * Do we need meta-buckets?
+  - Do we need meta-buckets?
 * Iterate over usize instead of u8 for used bits
-* Port to Windows
 * When configured to be non-thread-safe, then detect usage with multiple threads,
   and print stack traces showing where it was used in each thread.
 * Write unit tests / regression tests
@@ -159,6 +163,5 @@ is memory protected with the same strategy as the allocator's state.
   for large objects.
 * Test whether it is an improvement to try to use an mmap hint when growing
   a large object and it has to mmap more.
-* What if all the address space is used? A plan for unmapping at some point.
 * Once a bucket becomes full, remove it from the linked list of buckets that are
   used to find allocation slots.
