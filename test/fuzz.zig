@@ -50,6 +50,6 @@ test "fuzz testing" {
             }
             free_i += 1;
         }
-        std.debug.warn("index={} allocated: {Bi2} freed: {Bi2}\n", it_index, allocated_n, freed_n);
+        std.debug.warn("index={} allocated: {Bi:2} freed: {Bi:2}\n", it_index, allocated_n, freed_n);
     }
 }

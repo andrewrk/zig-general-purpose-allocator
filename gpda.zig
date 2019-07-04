@@ -1083,8 +1083,7 @@ test "isAligned works" {
 }
 
 test "large object shrinks to small but allocation fails during shrink" {
-    const direct_allocator = &std.heap.DirectAllocator.init().allocator;
-    var failing_allocator = std.debug.FailingAllocator.init(direct_allocator, 3);
+    var failing_allocator = std.debug.FailingAllocator.init(std.heap.direct_allocator, 3);
     const gpda = try GeneralPurposeDebugAllocator(Config{
         .backing_allocator = true,
         .memory_protection = false,
