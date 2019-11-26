@@ -2,8 +2,6 @@
 
 This is the code for [my Zig Live Coding Stream](https://www.twitch.tv/andrewrok).
 
-[Support my work on Patreon](https://www.patreon.com/andrewrk).
-
 This is a work-in-progress general purpose allocator intended to be eventually merged
 into the [Zig](https://ziglang.org/) standard library, with the focus on these goals:
 
