@@ -12,8 +12,8 @@ test "fuzz testing" {
     var prng = std.rand.DefaultPrng.init(seed);
     const rand = &prng.random;
 
-    var allocated_n: usize = 0;
-    var freed_n: usize = 0;
+    var allocated_n: u64 = 0;
+    var freed_n: u64 = 0;
 
     const Free = struct {
         slice: []u8,
