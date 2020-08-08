@@ -1,3 +1,10 @@
+# This Project Has Been Merged Upstream
+
+This code was integrated into the Zig Standard Library in
+[Pull Request #5998](https://github.com/ziglang/zig/pull/5998).
+
+**This repository is no longer maintained.**
+
 # GeneralPurposeDebugAllocator
 
 This is the code for [my Zig Live Coding Stream](https://www.twitch.tv/andrewrok).
